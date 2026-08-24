@@ -28,16 +28,17 @@ Usage::
 """
 
 from __future__ import annotations
+
+import math
 from collections import defaultdict
 from typing import Any
-import math
 
 from soft_entropy.temp_calibration import find_eps
-
 
 # ---------------------------------------------------------------------------
 # Backend abstraction
 # ---------------------------------------------------------------------------
+
 
 def _get_ops(backend: str, dtype=None):
     """Return a namespace of array operations for the requested backend."""
@@ -47,21 +48,32 @@ def _get_ops(backend: str, dtype=None):
         class NumpyOps:
             def zeros(self, shape):
                 return np.zeros(shape, dtype=np.float32)
+
             def normalize(self, x):
                 return x / np.linalg.norm(x, axis=-1, keepdims=True)
+
             def randn(self, shape, seed):
-                return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+                return (
+                    np.random.default_rng(seed)
+                    .standard_normal(shape)
+                    .astype(np.float32)
+                )
+
             def softmax(self, x, temp):
                 x = x / temp
                 x -= x.max(axis=-1, keepdims=True)
                 e = np.exp(x)
                 return e / e.sum(axis=-1, keepdims=True)
+
             def matmul(self, a, b):
                 return a @ b
+
             def sum_axis0(self, x):
                 return x.sum(axis=0)
+
             def to_device(self, x):
                 return x
+
             def to_numpy(self, x):
                 return x
 
@@ -83,19 +95,26 @@ def _get_ops(backend: str, dtype=None):
         class TorchOps:
             def zeros(self, shape):
                 return torch.zeros(shape, device=device, dtype=dtype)
+
             def normalize(self, x):
                 return F.normalize(x, dim=-1)
+
             def randn(self, shape, seed):
                 g = torch.Generator(device=device).manual_seed(seed)
                 return torch.randn(*shape, generator=g, device=device, dtype=dtype)
+
             def softmax(self, x, temp):
                 return F.softmax(x / temp, dim=-1)
+
             def matmul(self, a, b):
                 return a @ b
+
             def sum_axis0(self, x):
                 return x.sum(0)
+
             def to_device(self, x):
                 return x.to(device=device, dtype=dtype)
+
             def to_numpy(self, x):
                 return x.detach().cpu().float().numpy()
 
@@ -110,31 +129,46 @@ def _get_ops(backend: str, dtype=None):
         class JaxOps:
             def zeros(self, shape):
                 return jnp.zeros(shape, dtype=jax_dtype)
+
             def normalize(self, x):
                 return x / jnp.linalg.norm(x, axis=-1, keepdims=True)
+
             def randn(self, shape, seed):
-                return jax.random.normal(jax.random.PRNGKey(seed), shape=shape, dtype=jax_dtype)
+                return jax.random.normal(
+                    jax.random.PRNGKey(seed), shape=shape, dtype=jax_dtype
+                )
+
             def softmax(self, x, temp):
                 return jax.nn.softmax(x / temp, axis=-1)
+
             def matmul(self, a, b):
                 return a @ b
+
             def sum_axis0(self, x):
                 return x.sum(axis=0)
+
             def to_device(self, x):
-                return x.astype(jax_dtype)  # JAX places arrays on GPU automatically via XLA
+                return x.astype(
+                    jax_dtype
+                )  # JAX places arrays on GPU automatically via XLA
+
             def to_numpy(self, x):
                 import numpy as np
+
                 return np.array(x, dtype=np.float32)
 
         return JaxOps()
 
     else:
-        raise ValueError(f"Unknown backend '{backend}'. Choose 'numpy', 'torch', or 'jax'.")
+        raise ValueError(
+            f"Unknown backend '{backend}'. Choose 'numpy', 'torch', or 'jax'."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Accumulator
 # ---------------------------------------------------------------------------
+
 
 class SoftEntropyAccumulator:
     """
@@ -160,7 +194,14 @@ class SoftEntropyAccumulator:
                  model that outputs bfloat16 and avoid casting overhead.
     """
 
-    def __init__(self, d: int, n_bins: int = 100, seed: int = 0, backend: str = "numpy", dtype=None):
+    def __init__(
+        self,
+        d: int,
+        n_bins: int = 100,
+        seed: int = 0,
+        backend: str = "numpy",
+        dtype=None,
+    ):
         self.n_bins = n_bins
         self.backend = backend
         self.ops = _get_ops(backend, dtype=dtype)
@@ -205,9 +246,9 @@ class SoftEntropyAccumulator:
         ops = self.ops
 
         z = ops.to_device(z)
-        z_norm = ops.normalize(z)                 # [batch, d]
-        scores = ops.matmul(z_norm, self.w.T)     # [batch, n_bins]
-        p = ops.softmax(scores, self.temp)         # [batch, n_bins]
+        z_norm = ops.normalize(z)  # [batch, d]
+        scores = ops.matmul(z_norm, self.w.T)  # [batch, n_bins]
+        p = ops.softmax(scores, self.temp)  # [batch, n_bins]
 
         self._counts = self._counts + ops.sum_axis0(p)
         self._n_samples += z.shape[0]
@@ -220,9 +261,9 @@ class SoftEntropyAccumulator:
 
         for set_name, set_labels in label_sets.items():
             for label_val, idx in self._group_by_label(set_labels):
-                self._label_counts[set_name][label_val] = (
-                    self._label_counts[set_name][label_val] + ops.sum_axis0(p[idx])
-                )
+                self._label_counts[set_name][label_val] = self._label_counts[set_name][
+                    label_val
+                ] + ops.sum_axis0(p[idx])
                 self._label_n_samples[set_name][label_val] += len(idx)
 
     # ------------------------------------------------------------------
@@ -281,6 +322,7 @@ class SoftEntropyAccumulator:
 
     def _h_from_counts(self, counts) -> float:
         import numpy as np
+
         p = self.ops.to_numpy(counts)
         p = p / p.sum()
         h = -(p * np.log(np.clip(p, 1e-9, None))).sum()
@@ -289,11 +331,22 @@ class SoftEntropyAccumulator:
     def _group_by_label(self, labels):
         """Yield (label_value, indices) pairs, backend-agnostically."""
         import numpy as np
-        if hasattr(labels, "detach"):       # torch
+
+        if hasattr(labels, "detach"):  # torch
             labels_np = labels.detach().cpu().numpy()
-        elif hasattr(labels, "devices"):    # jax
+        elif hasattr(labels, "devices"):  # jax
             labels_np = np.array(labels)
         else:
-            labels_np = labels
-        for label in np.unique(labels_np):
-            yield label, np.where(labels_np == label)[0]
+            labels_np = np.asarray(labels)
+        if labels_np.ndim == 1:
+            for label in np.unique(labels_np):
+                yield label, np.where(labels_np == label)[0]
+            return
+        if labels_np.ndim == 2:
+            unique_labels, inverse = np.unique(labels_np, axis=0, return_inverse=True)
+            for label_index, label in enumerate(unique_labels):
+                yield tuple(label.tolist()), np.where(inverse == label_index)[0]
+            return
+        raise ValueError(
+            f"Labels must be one- or two-dimensional, got shape {labels_np.shape}."
+        )

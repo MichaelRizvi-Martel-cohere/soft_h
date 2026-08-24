@@ -12,28 +12,42 @@ class AnalyzeTaxActivationsTest(unittest.TestCase):
     def _write_dataset(self, root: Path) -> None:
         hook = "block_0_block_output"
         activation_key = f"activation__{hook}"
-        activation = np.arange(1, 25, dtype=np.float32).reshape(6, 4)
+        activation = np.arange(1, 49, dtype=np.float32).reshape(12, 4)
         np.savez(
             root / "batch_00000.npz",
-            input_token=np.array([1, 1, 2, 2, 3, 3], dtype=np.int64),
-            output_token=np.array([2, 2, 3, 3, 4, 4], dtype=np.int64),
+            input_token=np.arange(1, 13, dtype=np.int64),
+            output_token=np.arange(2, 14, dtype=np.int64),
+            batch_row=np.zeros(12, dtype=np.int64),
+            sequence_id=np.full(12, 7, dtype=np.int64),
+            position=np.arange(12, dtype=np.int64),
             **{activation_key: activation},
         )
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "checkpoint": "test-checkpoint",
             "hooks": [hook],
             "activation_keys": {hook: activation_key},
             "activation_dtype": "float32",
-            "label_keys": ["input_token", "output_token"],
+            "label_keys": [
+                "input_token",
+                "output_token",
+                "batch_row",
+                "sequence_id",
+                "position",
+            ],
+            "input_source": "fixed_drydock_eval",
+            "eval_data_path": "c4.parquet",
+            "sequence_length": 512,
+            "tokenizer_path": "tokenizer.json",
             "shards": [
                 {
                     "file": "batch_00000.npz",
-                    "n_samples": 6,
+                    "n_samples": 12,
                     "hook_dimensions": {hook: 4},
                 }
             ],
-            "total_samples": 6,
+            "total_samples": 12,
+            "total_sequences": 1,
         }
         (root / "manifest.json").write_text(json.dumps(manifest))
 
@@ -50,8 +64,10 @@ class AnalyzeTaxActivationsTest(unittest.TestCase):
         self.assertEqual(hook_result["dimension"], 4)
         self.assertEqual(hook_result["n_samples"], 6)
         self.assertTrue(0 <= hook_result["H(Z)"] <= 1)
-        self.assertTrue(np.isfinite(hook_result["I(X;Z)/input_token"]))
-        self.assertTrue(np.isfinite(hook_result["I(X;Z)/output_token"]))
+        for ngram in ("unigram", "bigram", "trigram", "quadgram"):
+            self.assertTrue(np.isfinite(hook_result[f"I(X;Z)/input_{ngram}"]))
+            self.assertTrue(np.isfinite(hook_result[f"I(X;Z)/output_{ngram}"]))
+            self.assertTrue(np.isfinite(hook_result[f"optimality/{ngram}"]))
 
     def test_rejects_shard_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

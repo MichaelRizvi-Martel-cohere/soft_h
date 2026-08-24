@@ -8,6 +8,28 @@ Use Fax/Tax to load a model checkpoint, run model inference with intermediate
 activation hooks, export aligned activation and token-label tensors, and consume
 those tensors in `soft_h` to estimate soft entropy and mutual information.
 
+## Native data path decision
+
+Always use Fax's existing evaluation pipeline for dataset-backed activation
+experiments. Do not add a parallel JSONL tokenizer or batcher to Tax.
+
+The shortest C4 path is:
+
+1. `soft_h` freezes the selected public C4 documents once.
+2. Store those documents as Parquet records with a `content` column.
+3. Patch the checkpoint run config to use one fixed source:
+   `eval_data_dir_dict = {"drydock": {"gs://.../*.parquet": 1.0}}`.
+4. Fax's existing `get_data_loaders()` and `GPTBalancedDataLoader` invoke
+   Drydock to tokenize, pack, mask, batch, and shard the records with the
+   checkpoint tokenizer.
+5. The Tax extraction script only runs `forward_with_hooks_step` and exports
+   aligned activations and loader-provided labels/sequence metadata.
+
+Tax's production images already install the `drydock` extra. This route requires
+no changes to `fax_mono`, no new Tax dataloader, no literal prompt, and no new
+`command_data` dataset class or TFRecord build. Dataset selection is a run-config
+override, not model inference code.
+
 The repositories remain independent. Tax writes a portable directory of numeric
 NPZ shards plus a JSON manifest. `soft_h` reads that directory. There is no
 Python package dependency between the repositories.
@@ -327,37 +349,97 @@ diagnostic unless cost/capacity requires a staged TP=4 attempt.
 The submission is materially more expensive than the approved 2-H100 run and
 requires fresh explicit approval.
 
-### Real BLS activation extraction
+### C4 activation extraction
 
-After generation succeeds:
+The controlled input is the pinned English C4 validation artifact described by
+its adjacent manifest. The artifact includes a Drydock-compatible Parquet file
+whose only data column is binary `content`. The launcher passes that path as an
+explicit Fax run-config override. Fax's existing evaluation loader tokenizes,
+packs, masks, batches, and shards the records with a 512-token maximum sequence
+length and the checkpoint tokenizer. The extractor does not implement any of
+those data operations.
 
-1. Run `scripts/extract_activations.py` for one evaluation batch and one hook,
-   preferably `block_0_block_output`.
-2. Keep scanned forward passes and stacked-at-init parameters disabled.
-3. Write to a unique durable object-storage path rather than `/tmp`.
-4. Validate the manifest and shard shapes.
-5. Run the `soft_h` consumer with a fixed seed.
-6. Only then add more layers/hooks or batches.
+The `soft_h` consumer derives collision-free input/output unigram through
+quadgram labels from those exported token sequences. It masks positions without
+complete four-token preceding and trailing context, computes one result per
+block-output hook, and averages metrics uniformly across hooks.
+
+The native path has been exercised end to end on CPU with Fax's existing
+two-layer `tiny_mup` architecture and random initialization. The test used the
+production 50,261-token tokenizer, a 32-token context, four C4 sequences, and
+both block-output hooks. Fax/Drydock produced the batch, Tax exported 128 aligned
+activation rows of dimension 256 per hook, and `soft_h` analyzed 104 positions
+with complete quadgram context. All entropy, MI, regularity, and optimality
+metrics were finite. This was an integration test only, not a scientific model
+result.
+
+Tax now also has an `--online_entropy=True` mode in
+`scripts/extract_activations.py`. The existing hooked forward still produces one
+batch at a time, but the main loop immediately passes the aligned arrays to
+`soft_h`'s `TaxActivationAccumulator` and then discards them. The accumulator
+sums soft-bin assignments globally, including per-ngram conditional counts; it
+does not average per-batch entropy values. Online mode writes only
+`results.json`, not activation NPZ shards.
+
+`examples/test_tax_online_entropy_integration.py` exercises this path with the
+same native Drydock C4 input, production tokenizer, four-way simulated CPU
+mesh, and two-layer random `tiny_mup`. It accumulated 104 of 128 token positions
+for both 256-dimensional block outputs. Every entropy, MI, regularity, and
+optimality metric was finite, and the online values matched the existing
+NPZ-based analyzer within numerical tolerance. Unit tests also verify that two
+sequential updates equal one global update and that Tax online mode updates
+every batch without calling the NPZ writer.
+
+For online submissions, the launcher deterministically hashes the Python source
+under `soft_entropy`, stages an exact copy under Tax's `scripts/` image context,
+and sets the container `PYTHONPATH` to that packaged copy. The Tax Dockerfile
+already copies `scripts/` into `/app`, so no runtime network install is needed.
+The launcher verifies the staged hash, records it in `results.json`, and removes
+the temporary build-context copy after `kjobs fax submit` returns. The first
+packaged preflight used digest
+`d6a4cbdb299b3df779fbb028d2f08805662d3e23b7201d600d81c9e3d5060841`.
+This implementation removes persistent activation storage but still transfers
+each batch's raw hook outputs from Fax workers to the Ray head.
+
+The first BLS GPU gate succeeded as job
+`vm-michael-rizvi-fax-202608241920-ub6y`. It used eight H100s with TP=4,
+automatic FSDP=2, a `[2, 512]` C4 batch, and one
+`block_0_block_output` hook. Checkpoint step 536 restored, the hooked forward
+compiled and executed, and Tax wrote 1,024 float32 activation rows of dimension
+2,048 plus aligned token and sequence metadata. The complete Ray job took about
+seven minutes and produced:
+
+`gs://cohere-dev/michael-rizvi/soft_h_tax/bls30b_ckpt536_c4_block0_b1_seq512_native_v1`
+
+After staging the manifest and 8 MiB NPZ shard locally, `soft_h` analyzed 1,012
+positions with complete quadgram context. All entropy, MI, regularity, and
+optimality metrics were finite; for this integration batch,
+`H(Z) = 0.8805911541`. The current analysis CLI uses `pathlib` and therefore
+requires local staging rather than accepting the `gs://` directory directly.
+
+The checkpoint has 48 layers with hidden dimension 2,048. A full batch contains
+at most 1,024 activation rows, or 8 MiB per float32 block-output hook and 384 MiB
+for all 48 hooks before small metadata overhead. Even the lower bound of 5,000
+batches for 10,000 source documents would be about 1.88 TiB for all layers;
+Drydock may emit additional sequences for long documents. Scale the number of
+hooks and batches deliberately rather than extrapolating directly to the full
+protocol.
 
 Hooks retain full `[B, S, D]` representations before masking/export and may need
 more memory than generation alone. TP=8 is therefore a generation baseline,
 not a guarantee that many simultaneous BLS hooks will fit.
 
-The current extractor consumes the checkpoint's evaluation dataloader. It does
-not yet accept literal prompt strings. Add prompt-based input only if needed;
-the dataset path is the simplest route for entropy/MI experiments.
+All extraction uses the checkpoint evaluation-loader interface. C4 comparisons
+replace only its data source with `--eval_data_path`; there is no custom JSONL
+branch in Tax.
 
 ### Scientific choices still required
 
-Before interpreting metrics, decide:
-
-- which dataset and split to use;
-- which token positions to include;
-- whether labels should be input tokens, next tokens, sequence/task labels, or
-  another experimental variable;
-- which layers to compare;
-- a fixed `soft_h` seed and bin count;
-- sample counts sufficient for stable estimation.
+The fixed protocol is English C4 validation, 10,000 frozen documents, 512-token
+maximum context, all transformer block outputs, input/output unigram through
+quadgram labels, 100 bins, and seed 0. The paper does not specify its exact
+split, sampler, activation hook, special-token policy, or seeds, so the artifact
+and activation manifests record our explicit choices.
 
 Random-model and CI-batch results are integration tests only.
 

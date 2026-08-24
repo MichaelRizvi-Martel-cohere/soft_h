@@ -1,4 +1,4 @@
-"""Compute soft entropy and token mutual information from Tax activation shards."""
+"""Compute paper-aligned soft entropy and n-gram MI from Tax activation shards."""
 
 from __future__ import annotations
 
@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from soft_entropy.tax_online import TaxActivationAccumulator
 
-from soft_entropy.accumulator import SoftEntropyAccumulator
-
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MANIFEST_FIELDS = {
     "schema_version",
     "checkpoint",
@@ -21,6 +20,11 @@ _MANIFEST_FIELDS = {
     "label_keys",
     "shards",
     "total_samples",
+    "input_source",
+    "eval_data_path",
+    "sequence_length",
+    "tokenizer_path",
+    "total_sequences",
 }
 _SHARD_FIELDS = {"file", "n_samples", "hook_dimensions"}
 
@@ -30,7 +34,7 @@ def _load_manifest(activation_dir: Path) -> dict[str, Any]:
     with manifest_path.open() as file:
         manifest = json.load(file)
     if not isinstance(manifest, dict):
-        raise ValueError("Activation manifest must be a JSON object.")
+        raise TypeError("Activation manifest must be a JSON object.")
 
     missing = _MANIFEST_FIELDS - manifest.keys()
     unexpected = manifest.keys() - _MANIFEST_FIELDS
@@ -78,8 +82,7 @@ def analyze(
     root = Path(activation_dir)
     manifest = _load_manifest(root)
     hooks = manifest["hooks"]
-    accumulators: dict[str, SoftEntropyAccumulator] = {}
-    sample_counts = {hook: 0 for hook in hooks}
+    accumulator = TaxActivationAccumulator(hooks, n_bins=n_bins, seed=seed)
 
     for shard_spec in manifest["shards"]:
         shard_path = _resolve_shard(root, shard_spec["file"])
@@ -87,6 +90,9 @@ def analyze(
             required_keys = {
                 "input_token",
                 "output_token",
+                "batch_row",
+                "sequence_id",
+                "position",
                 *(manifest["activation_keys"][hook] for hook in hooks),
             }
             missing_keys = required_keys - set(shard.files)
@@ -95,66 +101,31 @@ def analyze(
                     f"Shard {shard_path} is missing keys {sorted(missing_keys)}."
                 )
 
-            input_token = shard["input_token"]
-            output_token = shard["output_token"]
-            if input_token.ndim != 1 or output_token.shape != input_token.shape:
+            arrays = {
+                "input_token": shard["input_token"],
+                "output_token": shard["output_token"],
+                "batch_row": shard["batch_row"],
+                "sequence_id": shard["sequence_id"],
+                "position": shard["position"],
+                **{
+                    f"activation__{hook}": shard[manifest["activation_keys"][hook]]
+                    for hook in hooks
+                },
+            }
+            if accumulator.update(arrays) == 0:
                 raise ValueError(
-                    f"Shard labels must be aligned 1-D arrays, got {input_token.shape} and {output_token.shape}."
+                    f"Shard {shard_path} has no positions with complete quadgram context."
                 )
-
-            for hook in hooks:
-                activation = shard[manifest["activation_keys"][hook]]
-                if activation.ndim != 2 or activation.shape[0] != input_token.shape[0]:
-                    raise ValueError(
-                        f"Activation {hook!r} in {shard_path} must be [N, D] and align with labels; "
-                        f"got {activation.shape} and {input_token.shape}."
-                    )
-                if not np.isfinite(activation).all():
-                    raise ValueError(
-                        f"Activation {hook!r} in {shard_path} contains non-finite values."
-                    )
-                if np.any(np.linalg.norm(activation, axis=-1) == 0):
-                    raise ValueError(
-                        f"Activation {hook!r} in {shard_path} contains zero-norm rows."
-                    )
-
-                if hook not in accumulators:
-                    accumulators[hook] = SoftEntropyAccumulator(
-                        d=activation.shape[-1],
-                        n_bins=n_bins,
-                        seed=seed,
-                        backend="numpy",
-                    )
-                elif accumulators[hook].w.shape[-1] != activation.shape[-1]:
-                    raise ValueError(
-                        f"Activation dimension changed across shards for hook {hook!r}."
-                    )
-
-                accumulators[hook].update(
-                    activation,
-                    labels={"input_token": input_token, "output_token": output_token},
-                )
-                sample_counts[hook] += activation.shape[0]
-
-    expected_samples = manifest["total_samples"]
-    if any(count != expected_samples for count in sample_counts.values()):
-        raise ValueError(
-            f"Sample counts {sample_counts} do not match manifest total {expected_samples}."
-        )
-
+    accumulated_results = accumulator.results()
     return {
         "schema_version": _SCHEMA_VERSION,
         "checkpoint": manifest["checkpoint"],
+        "eval_data_path": manifest["eval_data_path"],
+        "tokenizer_path": manifest["tokenizer_path"],
+        "sequence_length": manifest["sequence_length"],
         "n_bins": n_bins,
         "seed": seed,
-        "hooks": {
-            hook: {
-                **accumulators[hook].results(),
-                "dimension": int(accumulators[hook].w.shape[-1]),
-                "n_samples": sample_counts[hook],
-            }
-            for hook in hooks
-        },
+        **accumulated_results,
     }
 
 

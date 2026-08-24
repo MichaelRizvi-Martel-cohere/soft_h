@@ -3,7 +3,7 @@ LLM entropy analysis via soft entropy accumulation.
 
 Loads a causal LM and a text dataset from HuggingFace, runs batched inference,
 and uses SoftEntropyAccumulator to estimate per-layer H(Z) and I(X; Z) for
-unigram, bigram, and/or trigram token labels — without storing representations
+unigram through quadgram token labels — without storing representations
 in memory.
 
 Usage::
@@ -11,7 +11,7 @@ Usage::
     inferrer = LLMInferrer(
         model_id="HuggingFaceTB/SmolLM2-135M-Instruct",
         dataset_id="sentence-transformers/reddit",
-        label_types=["unigram", "bigram", "trigram"],
+        label_types=["unigram", "bigram", "trigram", "quadgram"],
     )
     results = inferrer.run(n_examples=500, batch_size=4)
     print(results["mean"])        # averages across transformer layers
@@ -19,21 +19,23 @@ Usage::
 """
 
 from __future__ import annotations
+
 import gc
+
 import torch
 from tqdm.auto import tqdm
 
 from soft_entropy.accumulator import SoftEntropyAccumulator
 
-
 _TEXT_COLUMN_CANDIDATES = ["text", "body", "sentence", "content", "document", "passage"]
 
-_ORDER = {"unigram": 1, "bigram": 2, "trigram": 3}
+_ORDER = {"unigram": 1, "bigram": 2, "trigram": 3, "quadgram": 4}
 
 
 def _infer_text_column(dataset) -> str:
     """Return the name of the text column, or raise if it can't be inferred."""
     from datasets import Value
+
     features = dataset.features
     for name in _TEXT_COLUMN_CANDIDATES:
         if name in features:
@@ -47,7 +49,13 @@ def _infer_text_column(dataset) -> str:
     )
 
 
-def _encode_ngram(ids: torch.Tensor, start: int, end: int, order: int, V: int, forward: bool) -> torch.Tensor:
+def _encode_ngram(
+    ids: torch.Tensor,
+    start: int,
+    end: int,
+    order: int,
+    forward: bool,
+) -> torch.Tensor:
     """
     Encode n-gram labels for valid positions start..end (exclusive).
 
@@ -55,22 +63,17 @@ def _encode_ngram(ids: torch.Tensor, start: int, end: int, order: int, V: int, f
       - forward=False (input):  n-gram ending at i   → ids[i-n+1], ..., ids[i]
       - forward=True  (output): n-gram starting at i+1 → ids[i+1], ..., ids[i+n]
 
-    Encodes as a single int64: t0*V^(n-1) + t1*V^(n-2) + ... + t_{n-1}.
-    All slices are guaranteed valid by the caller's choice of start/end.
+    Returns one row per n-gram instead of radix-packing token IDs. Row labels
+    remain collision-free even when a large-vocabulary quadgram exceeds int64.
     """
-    ids = ids.long()
     if forward:
-        # tokens ids[start+1:end+1], ids[start+2:end+2], ..., ids[start+order:end+order]
-        code = ids[start + 1: end + 1]
-        for k in range(2, order + 1):
-            code = code * V + ids[start + k: end + k]
+        columns = [ids[start + offset : end + offset] for offset in range(1, order + 1)]
     else:
-        # tokens ids[start-order+1:end-order+1], ..., ids[start:end]
-        code = ids[start - order + 1: end - order + 1]
-        for k in range(order - 2, -1, -1):
-            offset = start - k
-            code = code * V + ids[offset: end - k]
-    return code
+        columns = [
+            ids[start - order + 1 + offset : end - order + 1 + offset]
+            for offset in range(order)
+        ]
+    return torch.stack(columns, dim=-1).long()
 
 
 class LLMInferrer:
@@ -81,8 +84,9 @@ class LLMInferrer:
     each requested label type. Supported label types:
 
       - "unigram"  — current/next token id
-      - "bigram"   — 2-token n-gram encoded as t0*V + t1
-      - "trigram"  — 3-token n-gram encoded as t0*V^2 + t1*V + t2
+      - "bigram"   — current/next 2-token n-gram
+      - "trigram"  — current/next 3-token n-gram
+      - "quadgram" — current/next 4-token n-gram
 
     Each label type produces both an input label (what tokens produced Z_i)
     and an output label (what tokens Z_i predicts). When multiple orders are
@@ -92,6 +96,8 @@ class LLMInferrer:
     Args:
         model_id:      HuggingFace model identifier
         dataset_id:    HuggingFace dataset identifier
+        dataset_config: HuggingFace dataset configuration/subset
+        dataset_revision: pinned HuggingFace dataset revision
         label_types:   list of n-gram orders to estimate; any of
                        "unigram", "bigram", "trigram"
         n_bins:        number of soft reference bins for the accumulator
@@ -111,8 +117,10 @@ class LLMInferrer:
         max_length: int = 128,
         text_column: str | None = None,
         dataset_split: str = "train",
+        dataset_config: str | None = None,
+        dataset_revision: str | None = None,
     ):
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.model_id = model_id
         self.dataset_id = dataset_id
@@ -120,6 +128,8 @@ class LLMInferrer:
         self.max_length = max_length
         self.text_column = text_column
         self.dataset_split = dataset_split
+        self.dataset_config = dataset_config
+        self.dataset_revision = dataset_revision
         self.n_bins = n_bins
         self.seed = seed
 
@@ -141,7 +151,9 @@ class LLMInferrer:
         self.n_layers = self.model.config.num_hidden_layers
         model_dtype = next(self.model.parameters()).dtype
         self.accs = [
-            SoftEntropyAccumulator(d=d, n_bins=n_bins, seed=seed, backend="torch", dtype=model_dtype)
+            SoftEntropyAccumulator(
+                d=d, n_bins=n_bins, seed=seed, backend="torch", dtype=model_dtype
+            )
             for _ in range(self.n_layers + 1)  # index 0 = embedding layer
         ]
 
@@ -157,7 +169,13 @@ class LLMInferrer:
         """
         from datasets import load_dataset
 
-        dataset = load_dataset(self.dataset_id, split=self.dataset_split, streaming=True)
+        dataset = load_dataset(
+            self.dataset_id,
+            self.dataset_config,
+            split=self.dataset_split,
+            revision=self.dataset_revision,
+            streaming=True,
+        )
 
         if self.text_column is None:
             self.text_column = _infer_text_column(dataset)
@@ -193,12 +211,11 @@ class LLMInferrer:
         with torch.no_grad():
             output = self.model(**tokenized)
 
-        hidden_states  = output.hidden_states   # tuple: (n_layers+1) x [batch, seq, d]
-        input_ids      = tokenized["input_ids"]
+        hidden_states = output.hidden_states  # tuple: (n_layers+1) x [batch, seq, d]
+        input_ids = tokenized["input_ids"]
         attention_mask = tokenized["attention_mask"]
 
-        n   = self.max_order
-        V   = self.tokenizer.vocab_size
+        n = self.max_order
         # valid absolute positions for sequence of length L:
         #   start = n-1  (need n-1 prior tokens for input n-gram)
         #   end   = L-n  (exclusive; need n future tokens for output n-gram)
@@ -207,7 +224,7 @@ class LLMInferrer:
 
         for i in range(len(texts)):
             seq_len = int(attention_mask[i].sum().item())
-            start, end = n - 1, seq_len - n   # end is exclusive
+            start, end = n - 1, seq_len - n  # end is exclusive
             if end <= start:
                 continue
 
@@ -217,10 +234,10 @@ class LLMInferrer:
             for lt in self.label_types:
                 order = _ORDER[lt]
                 label_lists[f"input_{lt}"].append(
-                    _encode_ngram(ids, start, end, order, V, forward=False)
+                    _encode_ngram(ids, start, end, order, forward=False)
                 )
                 label_lists[f"output_{lt}"].append(
-                    _encode_ngram(ids, start, end, order, V, forward=True)
+                    _encode_ngram(ids, start, end, order, forward=True)
                 )
 
         if not seq_slices:
@@ -242,10 +259,23 @@ class LLMInferrer:
         gc.collect()
 
     def _label_keys(self) -> list[str]:
-        return [f"{direction}_{lt}" for lt in self.label_types for direction in ("input", "output")]
+        return [
+            f"{direction}_{lt}"
+            for lt in self.label_types
+            for direction in ("input", "output")
+        ]
 
     def _collect_results(self) -> dict:
-        per_layer = [acc.results() for acc in self.accs]
+        per_layer = []
+        for accumulator in self.accs:
+            layer_results = accumulator.results()
+            for label_type in self.label_types:
+                input_mi = layer_results[f"I(X;Z)/input_{label_type}"]
+                output_mi = layer_results[f"I(X;Z)/output_{label_type}"]
+                layer_results[f"optimality/{label_type}"] = (
+                    output_mi / input_mi if input_mi > 0 else float("nan")
+                )
+            per_layer.append(layer_results)
 
         transformer_layers = per_layer[1:]  # skip embedding at index 0
         keys = transformer_layers[0].keys()
