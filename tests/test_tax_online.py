@@ -99,6 +99,61 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
         self.assertEqual(results["hooks"][first_hook]["n_samples"], 6)
         self.assertEqual(results["hooks"][second_hook]["n_samples"], 6)
         self.assertTrue(np.isfinite(list(results["mean"].values())).all())
+        for name in NGRAM_ORDERS:
+            for direction in ("input", "output"):
+                label_name = f"{direction}_{name}"
+                mean_mi = np.mean(
+                    [
+                        results["hooks"][hook][f"I(X;Z)/{label_name}"]
+                        for hook in (first_hook, second_hook)
+                    ]
+                )
+                self.assertAlmostEqual(
+                    results["mean"][f"I(X;Z)/{label_name}"], mean_mi
+                )
+                self.assertAlmostEqual(
+                    results["mean"][f"regularity/{label_name}"],
+                    mean_mi / results["mean"]["H(Z)"],
+                )
+            self.assertAlmostEqual(
+                results["mean"][f"optimality/{name}"],
+                results["mean"][f"I(X;Z)/output_{name}"]
+                / results["mean"][f"I(X;Z)/input_{name}"],
+            )
+
+    def test_model_ratios_are_computed_after_averaging_layer_metrics(self):
+        hooks = ("block_0_block_output", "block_1_block_output")
+        accumulator = TaxActivationAccumulator(hooks, n_bins=8, seed=3)
+
+        class FakeLayerAccumulator:
+            def __init__(self, entropy, input_mi, output_mi):
+                self.w = np.empty((8, 4))
+                self._metrics = {"H(Z)": entropy}
+                for name in NGRAM_ORDERS:
+                    self._metrics[f"I(X;Z)/input_{name}"] = input_mi
+                    self._metrics[f"I(X;Z)/output_{name}"] = output_mi
+                    self._metrics[f"regularity/input_{name}"] = input_mi / entropy
+                    self._metrics[f"regularity/output_{name}"] = (
+                        output_mi / entropy
+                    )
+
+            def results(self):
+                return dict(self._metrics)
+
+        accumulator._accumulators = {
+            hooks[0]: FakeLayerAccumulator(0.2, 0.1, 0.1),
+            hooks[1]: FakeLayerAccumulator(0.8, 0.9, 0.45),
+        }
+        accumulator._sample_counts = {hook: 1 for hook in hooks}
+
+        mean = accumulator.results()["mean"]
+
+        self.assertAlmostEqual(mean["H(Z)"], 0.5)
+        self.assertAlmostEqual(mean["I(X;Z)/input_unigram"], 0.5)
+        self.assertAlmostEqual(mean["I(X;Z)/output_unigram"], 0.275)
+        self.assertAlmostEqual(mean["regularity/input_unigram"], 1.0)
+        self.assertAlmostEqual(mean["optimality/unigram"], 0.55)
+        self.assertNotAlmostEqual(mean["optimality/unigram"], (1.0 + 0.5) / 2)
 
     def test_empty_context_is_skipped_without_creating_partial_state(self):
         hook = "block_0_block_output"

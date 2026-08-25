@@ -197,16 +197,32 @@ class TaxActivationAccumulator:
                 "n_samples": self._sample_counts[hook],
             }
 
-        metric_keys = [
+        base_metric_keys = [
             key
             for key, value in hook_results[self.hooks[0]].items()
             if isinstance(value, float)
+            and not key.startswith(("regularity/", "optimality/"))
         ]
+        mean_metrics = {
+            key: sum(hook_results[hook][key] for hook in self.hooks)
+            / len(self.hooks)
+            for key in base_metric_keys
+        }
+        for name in NGRAM_ORDERS:
+            for direction in ("input", "output"):
+                label_name = f"{direction}_{name}"
+                mutual_information = mean_metrics[f"I(X;Z)/{label_name}"]
+                mean_metrics[f"regularity/{label_name}"] = (
+                    mutual_information / mean_metrics["H(Z)"]
+                    if mean_metrics["H(Z)"] > 0
+                    else float("nan")
+                )
+            input_mi = mean_metrics[f"I(X;Z)/input_{name}"]
+            output_mi = mean_metrics[f"I(X;Z)/output_{name}"]
+            mean_metrics[f"optimality/{name}"] = (
+                output_mi / input_mi if input_mi > 0 else float("nan")
+            )
         return {
             "hooks": hook_results,
-            "mean": {
-                key: sum(hook_results[hook][key] for hook in self.hooks)
-                / len(self.hooks)
-                for key in metric_keys
-            },
+            "mean": mean_metrics,
         }
