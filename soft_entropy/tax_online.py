@@ -10,6 +10,7 @@ from soft_entropy.accumulator import SoftEntropyAccumulator
 
 NGRAM_ORDERS = {"unigram": 1, "bigram": 2, "trigram": 3, "quadgram": 4}
 _ACTIVATION_PREFIX = "activation__"
+_STATE_SCHEMA_VERSION = 1
 _METADATA_KEYS = {
     "input_token",
     "output_token",
@@ -171,6 +172,99 @@ class TaxActivationAccumulator:
             self._sample_counts[hook] += selected_activation.shape[0]
 
         return int(selected_indices.size)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return a safe numeric checkpoint of every hook accumulator."""
+        missing_hooks = set(self.hooks) - self._accumulators.keys()
+        if missing_hooks:
+            raise ValueError(
+                f"Cannot checkpoint hooks without accumulated state: {sorted(missing_hooks)}."
+            )
+        return {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "hooks": list(self.hooks),
+            "n_bins": self.n_bins,
+            "seed": self.seed,
+            "backend": self.backend,
+            "sample_counts": dict(self._sample_counts),
+            "accumulators": {
+                hook: self._accumulators[hook].state_dict() for hook in self.hooks
+            },
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a checkpoint after validating its full experiment identity."""
+        expected_keys = {
+            "schema_version",
+            "hooks",
+            "n_bins",
+            "seed",
+            "backend",
+            "sample_counts",
+            "accumulators",
+        }
+        if set(state) != expected_keys:
+            raise ValueError(
+                "Tax accumulator checkpoint fields differ from the expected schema."
+            )
+        expected_metadata = {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "hooks": list(self.hooks),
+            "n_bins": self.n_bins,
+            "seed": self.seed,
+            "backend": self.backend,
+        }
+        for name, expected in expected_metadata.items():
+            if state[name] != expected:
+                raise ValueError(
+                    f"Tax accumulator checkpoint {name}={state[name]!r} does not "
+                    f"match the configured value {expected!r}."
+                )
+
+        sample_counts = state["sample_counts"]
+        accumulator_states = state["accumulators"]
+        if (
+            not isinstance(sample_counts, dict)
+            or set(sample_counts) != set(self.hooks)
+            or not isinstance(accumulator_states, dict)
+            or set(accumulator_states) != set(self.hooks)
+        ):
+            raise ValueError("Tax accumulator checkpoint hook state is incomplete.")
+
+        restored_accumulators: dict[str, SoftEntropyAccumulator] = {}
+        restored_sample_counts: dict[str, int] = {}
+        for hook in self.hooks:
+            hook_state = accumulator_states[hook]
+            if not isinstance(hook_state, dict):
+                raise TypeError(
+                    f"Tax accumulator checkpoint for hook {hook!r} must be a dictionary."
+                )
+            sample_count = sample_counts[hook]
+            if not isinstance(sample_count, int) or sample_count < 0:
+                raise ValueError(
+                    f"Tax accumulator sample count for hook {hook!r} is invalid."
+                )
+            dimension = hook_state.get("dimension")
+            if not isinstance(dimension, int) or dimension < 1:
+                raise ValueError(
+                    f"Tax accumulator dimension for hook {hook!r} is invalid."
+                )
+            accumulator = SoftEntropyAccumulator(
+                d=dimension,
+                n_bins=self.n_bins,
+                seed=self.seed,
+                backend=self.backend,
+            )
+            accumulator.load_state_dict(hook_state)
+            if accumulator.n_samples != sample_count:
+                raise ValueError(
+                    f"Tax accumulator sample count for hook {hook!r} is inconsistent."
+                )
+            restored_accumulators[hook] = accumulator
+            restored_sample_counts[hook] = sample_count
+
+        self._accumulators = restored_accumulators
+        self._sample_counts = restored_sample_counts
 
     def results(self) -> dict[str, Any]:
         """Return per-hook and uniformly averaged paper-aligned metrics."""

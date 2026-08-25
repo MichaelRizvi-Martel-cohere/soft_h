@@ -336,11 +336,40 @@ requires 128 aligned token rows, 104 positions with complete quadgram context,
 finite metrics for both hooks, numerical agreement between online and offline
 analysis, and no persistent activation shard in the online output.
 
+Use multiple batches to stress the accumulator checkpoint round trip with real
+random-model activations:
+
+```bash
+PYTHONPATH="${HOME}/repos/soft_h:${HOME}/repos/tax" \
+  uv run --project "${HOME}/repos/tax" --extra drydock \
+  python "${HOME}/repos/soft_h/examples/test_tax_online_entropy_integration.py" \
+  --n-batches 20
+```
+
 With `--online-entropy`, the launcher hashes the local `soft_entropy` Python
 source, stages that exact source under Tax's `scripts/` Docker build context,
 and sets the image command's `PYTHONPATH` accordingly. It verifies the staged
 digest before submission, records the digest in `results.json`, and removes the
 temporary source copy after `kjobs fax submit` returns.
+
+Online launcher runs checkpoint every 50 completed batches by default. Override
+that with `--checkpoint-every`; zero disables checkpointing. To resume, reuse
+the original run name and total `--max-batches`, then pass the complete numbered
+checkpoint explicitly:
+
+```bash
+examples/submit_tax_activations.sh \
+  ... \
+  --online-entropy \
+  --max-batches 250 \
+  --run-name <same-run-name> \
+  --resume-from \
+    gs://cohere-dev/michael-rizvi/soft_h_tax/<same-run-name>/checkpoints/batch_00100
+```
+
+Resume reloads and recompiles the model, but it does not repeat model forwards
+for the first 100 batches. It replays those batches through the unshuffled
+evaluation loader and verifies their token-prefix hash before continuing.
 
 ## Analyze the exported activations
 

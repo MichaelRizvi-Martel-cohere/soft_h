@@ -390,6 +390,15 @@ NPZ-based analyzer within numerical tolerance. Unit tests also verify that two
 sequential updates equal one global update and that Tax online mode updates
 every batch without calling the NPZ writer.
 
+The checkpoint stress test ran 20 native C4 batches through the two-layer random
+model: 2,560 aligned token rows and 2,080 selected entropy positions for each of
+two hooks. It checkpointed after batch 10, restored into new accumulators, and
+matched both uninterrupted accumulation and the 20-shard offline analyzer. The
+first stress attempt exposed that one-token tuple labels were being restored as
+scalars, which split repeated unigram counts across the restart. Checkpoint
+schema version 2 now preserves scalar-versus-tuple label identity, and the
+repeated-label regression plus the full stress test pass.
+
 For online submissions, the launcher deterministically hashes the Python source
 under `soft_entropy`, stages an exact copy under Tax's `scripts/` image context,
 and sets the container `PYTHONPATH` to that packaged copy. The Tax Dockerfile
@@ -400,6 +409,18 @@ packaged preflight used digest
 `d6a4cbdb299b3df779fbb028d2f08805662d3e23b7201d600d81c9e3d5060841`.
 This implementation removes persistent activation storage but still transfers
 each batch's raw hook outputs from Fax workers to the Ray head.
+
+Online mode supports numbered accumulator checkpoints through
+`--checkpoint_every=N` and explicit resume through `--resume_from=...`. A
+checkpoint contains only numeric soft-bin counts, conditional n-gram counts,
+reference points, counters, and a run fingerprint; it does not duplicate the
+unchanged Fax model checkpoint. Tax writes `COMPLETE` last and retains only the
+newest complete accumulator checkpoint. Resume reloads the same Fax model,
+restores the accumulator, and replays already-consumed Drydock batches without
+model inference. A rolling hash of the aligned token prefix must match before
+new forwards run, so changed data order or configuration fails closed.
+`max_batches` remains the total target rather than the number of additional
+batches after resume.
 
 The first BLS GPU gate succeeded as job
 `vm-michael-rizvi-fax-202608241920-ub6y`. It used eight H100s with TP=4,

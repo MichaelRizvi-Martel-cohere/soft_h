@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 import numpy as np
@@ -154,6 +155,92 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
         self.assertAlmostEqual(mean["regularity/input_unigram"], 1.0)
         self.assertAlmostEqual(mean["optimality/unigram"], 0.55)
         self.assertNotAlmostEqual(mean["optimality/unigram"], (1.0 + 0.5) / 2)
+
+    def test_checkpoint_resume_matches_uninterrupted_updates(self):
+        hooks = ("block_0_block_output", "block_1_block_output")
+        batches = []
+        for index in range(6):
+            batch = _make_batch(10 + 20 * index, scale=1 + index / 10)
+            batch[f"activation__{hooks[1]}"] = (
+                batch[f"activation__{hooks[0]}"][:, ::-1] + index
+            )
+            batches.append(batch)
+
+        uninterrupted = TaxActivationAccumulator(hooks, n_bins=8, seed=3)
+        for batch in batches:
+            uninterrupted.update(batch)
+
+        before_restart = TaxActivationAccumulator(hooks, n_bins=8, seed=3)
+        for batch in batches[:3]:
+            before_restart.update(batch)
+        state = before_restart.state_dict()
+        resumed = TaxActivationAccumulator(hooks, n_bins=8, seed=3)
+        resumed.load_state_dict(state)
+        for batch in batches[3:]:
+            resumed.update(batch)
+
+        expected = uninterrupted.results()
+        actual = resumed.results()
+        for hook in hooks:
+            self.assertEqual(
+                actual["hooks"][hook]["n_samples"],
+                expected["hooks"][hook]["n_samples"],
+            )
+            for name, value in expected["hooks"][hook].items():
+                if isinstance(value, float):
+                    self.assertTrue(
+                        np.isclose(
+                            actual["hooks"][hook][name],
+                            value,
+                            rtol=1e-6,
+                            atol=1e-7,
+                        ),
+                        msg=f"{name} differs after restoring hook {hook}.",
+                    )
+
+    def test_checkpoint_preserves_repeated_unigram_tuple_labels(self):
+        hook = "block_0_block_output"
+        first = _make_batch(10, scale=1)
+        second = _make_batch(10, scale=2)
+
+        uninterrupted = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        uninterrupted.update(first)
+        uninterrupted.update(second)
+
+        before_restart = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        before_restart.update(first)
+        resumed = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        resumed.load_state_dict(before_restart.state_dict())
+        resumed.update(second)
+
+        expected = uninterrupted.results()["hooks"][hook]
+        actual = resumed.results()["hooks"][hook]
+        for name, value in expected.items():
+            if isinstance(value, float):
+                self.assertTrue(
+                    np.isclose(actual[name], value, rtol=1e-6, atol=1e-7),
+                    msg=f"{name} differs after restoring repeated labels.",
+                )
+
+    def test_checkpoint_rejects_incompatible_seed(self):
+        hook = "block_0_block_output"
+        accumulator = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        accumulator.update(_make_batch(10))
+
+        restored = TaxActivationAccumulator((hook,), n_bins=8, seed=4)
+        with self.assertRaisesRegex(ValueError, "seed"):
+            restored.load_state_dict(accumulator.state_dict())
+
+    def test_checkpoint_rejects_tampered_counts(self):
+        hook = "block_0_block_output"
+        accumulator = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        accumulator.update(_make_batch(10))
+        state = copy.deepcopy(accumulator.state_dict())
+        state["accumulators"][hook]["counts"][0] = -1
+
+        restored = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        with self.assertRaisesRegex(ValueError, "global counts"):
+            restored.load_state_dict(state)
 
     def test_empty_context_is_skipped_without_creating_partial_state(self):
         hook = "block_0_block_output"

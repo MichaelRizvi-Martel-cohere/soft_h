@@ -35,6 +35,8 @@ from typing import Any
 
 from soft_entropy.temp_calibration import find_eps
 
+_STATE_SCHEMA_VERSION = 2
+
 # ---------------------------------------------------------------------------
 # Backend abstraction
 # ---------------------------------------------------------------------------
@@ -202,7 +204,9 @@ class SoftEntropyAccumulator:
         backend: str = "numpy",
         dtype=None,
     ):
+        self.d = d
         self.n_bins = n_bins
+        self.seed = seed
         self.backend = backend
         self.ops = _get_ops(backend, dtype=dtype)
 
@@ -230,6 +234,183 @@ class SoftEntropyAccumulator:
     def reset(self):
         """Clear all accumulated counts."""
         self._reset_counts()
+
+    @property
+    def n_samples(self) -> int:
+        """Number of embeddings accumulated so far."""
+        return self._n_samples
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return a backend-independent, numeric checkpoint state."""
+        import numpy as np
+
+        label_counts: dict[str, dict[str, Any]] = {}
+        for set_name, counts_by_label in self._label_counts.items():
+            ordered_items = sorted(
+                counts_by_label.items(), key=lambda item: repr(item[0])
+            )
+            labels_are_tuples = {isinstance(label, tuple) for label, _ in ordered_items}
+            if len(labels_are_tuples) != 1:
+                raise TypeError(
+                    f"Label set {set_name!r} mixes scalar and tuple labels."
+                )
+            label_rows = [
+                list(label) if isinstance(label, tuple) else [label]
+                for label, _ in ordered_items
+            ]
+            labels = np.asarray(label_rows)
+            if labels.dtype == np.dtype("O"):
+                raise TypeError(
+                    f"Label set {set_name!r} contains values that cannot be checkpointed safely."
+                )
+            label_counts[set_name] = {
+                "labels": labels,
+                "labels_are_tuples": labels_are_tuples.pop(),
+                "counts": np.stack(
+                    [self.ops.to_numpy(counts) for _, counts in ordered_items]
+                ),
+                "n_samples": np.asarray(
+                    [
+                        self._label_n_samples[set_name][label]
+                        for label, _ in ordered_items
+                    ],
+                    dtype=np.int64,
+                ),
+            }
+
+        return {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "dimension": self.d,
+            "n_bins": self.n_bins,
+            "seed": self.seed,
+            "backend": self.backend,
+            "temperature": self.temp,
+            "reference_points": self.ops.to_numpy(self.w),
+            "counts": self.ops.to_numpy(self._counts),
+            "n_samples": self._n_samples,
+            "label_counts": label_counts,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore and validate a state produced by :meth:`state_dict`."""
+        import numpy as np
+
+        expected_keys = {
+            "schema_version",
+            "dimension",
+            "n_bins",
+            "seed",
+            "backend",
+            "temperature",
+            "reference_points",
+            "counts",
+            "n_samples",
+            "label_counts",
+        }
+        if set(state) != expected_keys:
+            raise ValueError(
+                "Accumulator checkpoint fields differ from the expected schema: "
+                f"expected {sorted(expected_keys)}, got {sorted(state)}."
+            )
+        expected_metadata = {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "dimension": self.d,
+            "n_bins": self.n_bins,
+            "seed": self.seed,
+            "backend": self.backend,
+        }
+        for name, expected in expected_metadata.items():
+            if state[name] != expected:
+                raise ValueError(
+                    f"Accumulator checkpoint {name}={state[name]!r} does not match "
+                    f"the configured value {expected!r}."
+                )
+        if not np.isclose(state["temperature"], self.temp, rtol=0, atol=1e-12):
+            raise ValueError("Accumulator checkpoint temperature does not match.")
+
+        reference_points = np.asarray(state["reference_points"], dtype=np.float32)
+        expected_reference_points = self.ops.to_numpy(self.w)
+        if (
+            reference_points.shape != (self.n_bins, self.d)
+            or not np.isfinite(reference_points).all()
+            or not np.array_equal(reference_points, expected_reference_points)
+        ):
+            raise ValueError(
+                "Accumulator checkpoint reference points do not match the configured seed."
+            )
+
+        counts = np.asarray(state["counts"], dtype=np.float32)
+        n_samples = state["n_samples"]
+        if not isinstance(n_samples, int) or n_samples < 0:
+            raise ValueError(
+                f"Accumulator checkpoint n_samples must be non-negative, got {n_samples!r}."
+            )
+        if (
+            counts.shape != (self.n_bins,)
+            or not np.isfinite(counts).all()
+            or np.any(counts < 0)
+            or not np.isclose(counts.sum(), n_samples, rtol=1e-4, atol=1e-3)
+        ):
+            raise ValueError("Accumulator checkpoint global counts are invalid.")
+        label_counts = state["label_counts"]
+        if not isinstance(label_counts, dict):
+            raise TypeError("Accumulator checkpoint label_counts must be a dictionary.")
+
+        self._reset_counts()
+        self.w = self.ops.to_device(reference_points)
+        self._counts = self.ops.to_device(counts)
+        self._n_samples = n_samples
+        for set_name, label_state in label_counts.items():
+            if not isinstance(set_name, str) or not isinstance(label_state, dict):
+                raise TypeError("Accumulator checkpoint label state is invalid.")
+            if set(label_state) != {
+                "labels",
+                "labels_are_tuples",
+                "counts",
+                "n_samples",
+            }:
+                raise ValueError(
+                    f"Accumulator checkpoint label set {set_name!r} has invalid fields."
+                )
+            labels = np.asarray(label_state["labels"])
+            labels_are_tuples = label_state["labels_are_tuples"]
+            conditional_counts = np.asarray(label_state["counts"], dtype=np.float32)
+            label_n_samples = np.asarray(label_state["n_samples"])
+            if (
+                not isinstance(labels_are_tuples, bool)
+                or labels.ndim != 2
+                or labels.shape[1] < 1
+                or labels.dtype == np.dtype("O")
+                or conditional_counts.shape != (labels.shape[0], self.n_bins)
+                or label_n_samples.shape != (labels.shape[0],)
+                or not np.issubdtype(label_n_samples.dtype, np.integer)
+                or not np.isfinite(conditional_counts).all()
+                or np.any(conditional_counts < 0)
+                or np.any(label_n_samples < 0)
+                or not np.allclose(
+                    conditional_counts.sum(axis=1),
+                    label_n_samples,
+                    rtol=1e-4,
+                    atol=1e-3,
+                )
+            ):
+                raise ValueError(
+                    f"Accumulator checkpoint label set {set_name!r} is invalid."
+                )
+
+            restored_labels: list[Any] = []
+            for row in labels:
+                values = tuple(value.item() for value in row)
+                restored_labels.append(values if labels_are_tuples else values[0])
+            if len(set(restored_labels)) != len(restored_labels):
+                raise ValueError(
+                    f"Accumulator checkpoint label set {set_name!r} contains duplicates."
+                )
+            for index, label in enumerate(restored_labels):
+                self._label_counts[set_name][label] = self.ops.to_device(
+                    conditional_counts[index]
+                )
+                self._label_n_samples[set_name][label] = int(label_n_samples[index])
 
     def update(self, z: Any, labels: Any = None):
         """

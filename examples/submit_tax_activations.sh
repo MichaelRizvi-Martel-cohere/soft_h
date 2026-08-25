@@ -15,6 +15,7 @@ readonly DEFAULT_TAX_REPO="${HOME}/repos/tax"
 readonly DEFAULT_TIME_LIMIT="1h"
 readonly DEFAULT_N_BINS="100"
 readonly DEFAULT_SEED="0"
+readonly DEFAULT_CHECKPOINT_EVERY="50"
 readonly SOFT_H_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly RUNTIME_PACKAGE_RELATIVE="scripts/_soft_h_runtime"
 
@@ -24,8 +25,9 @@ Usage:
   submit_tax_activations.sh --checkpoint URI --dataset-parquet URI \
     --max-batches N --run-name NAME [options]
 
-Prepare a one-node, 8-H100 Tax activation-extraction job. By default, this
-prints the complete job specification without submitting it.
+Prepare a Tax activation-extraction job. On cw-ca-east-01-prod, the launcher
+uses one four-GB200 node with one Ray worker process. By default, this prints
+the complete job specification without submitting it.
 
 Required:
   --checkpoint URI       Fax checkpoint under s3://us-east-01a/
@@ -43,6 +45,8 @@ Options:
   --online-entropy       Accumulate entropy online instead of writing NPZ shards
   --n-bins N             Number of soft bins (default: 100)
   --seed N               Soft-bin reference-point seed (default: 0)
+  --checkpoint-every N   Save online state every N batches; 0 disables (default: 50)
+  --resume-from URI      Resume a numbered accumulator checkpoint for this output
   --submit               Authenticate and submit the displayed specification
   -h, --help             Show this help
 
@@ -82,6 +86,8 @@ tax_repo="${DEFAULT_TAX_REPO}"
 online_entropy=false
 n_bins="${DEFAULT_N_BINS}"
 seed="${DEFAULT_SEED}"
+checkpoint_every="${DEFAULT_CHECKPOINT_EVERY}"
+resume_from=""
 submit=false
 
 while [[ $# -gt 0 ]]; do
@@ -150,6 +156,16 @@ while [[ $# -gt 0 ]]; do
       seed="$2"
       shift 2
       ;;
+    --checkpoint-every)
+      [[ $# -ge 2 ]] || die "--checkpoint-every requires a value."
+      checkpoint_every="$2"
+      shift 2
+      ;;
+    --resume-from)
+      [[ $# -ge 2 ]] || die "--resume-from requires a value."
+      resume_from="$2"
+      shift 2
+      ;;
     --submit)
       submit=true
       shift
@@ -180,12 +196,20 @@ done
 [[ "${priority}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--priority contains unsupported characters."
 [[ "${n_bins}" =~ ^[1-9][0-9]*$ ]] && (( n_bins >= 2 )) || die "--n-bins must be an integer of at least 2."
 [[ "${seed}" =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer."
+[[ "${checkpoint_every}" =~ ^[0-9]+$ ]] || die "--checkpoint-every must be a non-negative integer."
 
 if [[ -z "${output_dir}" ]]; then
   output_dir="${DEFAULT_OUTPUT_PREFIX}/${run_name}"
 fi
 [[ "${output_dir}" =~ ^gs://cohere-dev/[A-Za-z0-9._/-]+$ ]] ||
   die "--output-dir must be a shell-safe path under gs://cohere-dev/."
+if [[ -n "${resume_from}" ]]; then
+  [[ "${online_entropy}" == true ]] || die "--resume-from requires --online-entropy."
+  resume_parent="${resume_from%/*}"
+  resume_name="${resume_from##*/}"
+  [[ "${resume_parent}" == "${output_dir}/checkpoints" && "${resume_name}" =~ ^batch_[0-9]{5,}$ ]] ||
+    die "--resume-from must name ${output_dir}/checkpoints/batch_NNNNN."
+fi
 
 tax_repo="$(realpath "${tax_repo}")"
 [[ -f "${tax_repo}/ops/kjobs-compute.yaml" ]] || die "Tax compute config not found under ${tax_repo}."
@@ -202,17 +226,40 @@ else
   die "kjobs is not installed."
 fi
 
+sample_config_path="configs/sample.run.fragment"
+attention_impl="fax_fa3"
+if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
+  sample_config_path="configs/sample.gb200.run.fragment"
+  attention_impl="fax_fa4"
+fi
+[[ -f "${tax_repo}/${sample_config_path}" ]] ||
+  die "Tax sample config not found at ${tax_repo}/${sample_config_path}."
+
 extraction_args=(
   uv run --no-sync python scripts/extract_activations.py
   "--ckpt_path=${checkpoint}"
   "--output_dir=${output_dir}"
   "--hooks=${hooks}"
   "--max_batches=${max_batches}"
-  "--sample_config_path=configs/sample.run.fragment"
+  "--sample_config_path=${sample_config_path}"
   "--n_tensor_parallel=${DEFAULT_TENSOR_PARALLEL}"
   "--eval_data_path=${dataset_parquet}"
   "--max_sequence_length=${DEFAULT_SEQUENCE_LENGTH}"
 )
+n_gpus=8
+preflight_workers=1
+preflight_gpus_per_worker=8
+worker_description="1 node x 8 GPUs"
+fsdp_description="automatic (2 ways on the requested 8 GPUs)"
+custom_args="worker.count=1 time_limit=${DEFAULT_TIME_LIMIT}"
+if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
+  n_gpus=4
+  preflight_workers=1
+  preflight_gpus_per_worker=4
+  custom_args+=" worker.cpu=64 worker.gpu=4"
+  worker_description="1 node x 4 GB200s, one Ray worker process"
+  fsdp_description="automatic (1 way with TP=4 on the requested 4 GPUs)"
+fi
 soft_h_package_sha256=""
 if [[ "${online_entropy}" == true ]]; then
   soft_h_package_sha256="$(
@@ -225,7 +272,11 @@ if [[ "${online_entropy}" == true ]]; then
     "--n_bins=${n_bins}"
     "--seed=${seed}"
     "--soft_h_package_sha256=${soft_h_package_sha256}"
+    "--checkpoint_every=${checkpoint_every}"
   )
+  if [[ -n "${resume_from}" ]]; then
+    extraction_args+=("--resume_from=${resume_from}")
+  fi
   container_extraction_args=(
     env "PYTHONPATH=/app/${RUNTIME_PACKAGE_RELATIVE}"
     "${extraction_args[@]}"
@@ -244,15 +295,18 @@ Tax activation extraction
   batches    : ${max_batches}
   mode       : $([[ "${online_entropy}" == true ]] && printf 'online entropy' || printf 'raw activation export')
   bins/seed  : ${n_bins}/${seed}
+  checkpoint : every ${checkpoint_every} batches
+  resume     : ${resume_from:-fresh run}
   soft_h sha : ${soft_h_package_sha256:-not packaged}
   max seq    : ${DEFAULT_SEQUENCE_LENGTH}
+  attention  : ${attention_impl}
   tensor par : ${DEFAULT_TENSOR_PARALLEL}
-  FSDP       : automatic (2 ways on the requested 8 GPUs)
+  FSDP       : ${fsdp_description}
   context    : ${context}
   queue      : ${queue}
   priority   : ${priority}
   time limit : ${DEFAULT_TIME_LIMIT}
-  worker     : 1 node x 8 GPUs (from tax/ops/kjobs-compute.yaml)
+  worker     : ${worker_description}
   image      : build current Tax checkout with kjobs-generated timestamp tag
   command    : ${extraction_command}
 EOF
@@ -290,16 +344,16 @@ printf '\nRunning checkpoint, mesh, tokenizer, and C4-batch preflight on CPU...\
   if [[ "${online_entropy}" == true ]]; then
     AWS_PROFILE=caios \
       CLOUD_PROVIDER=coreweave \
-      FAX_NUMBER_WORKERS=1 \
-      FAX_NUMBER_GPUS_PER_WORKER=8 \
+      FAX_NUMBER_WORKERS="${preflight_workers}" \
+      FAX_NUMBER_GPUS_PER_WORKER="${preflight_gpus_per_worker}" \
       PYTHONPATH="${runtime_package_dir}" \
       "${extraction_args[@]}" \
       --preflight_only=True
   else
     AWS_PROFILE=caios \
       CLOUD_PROVIDER=coreweave \
-      FAX_NUMBER_WORKERS=1 \
-      FAX_NUMBER_GPUS_PER_WORKER=8 \
+      FAX_NUMBER_WORKERS="${preflight_workers}" \
+      FAX_NUMBER_GPUS_PER_WORKER="${preflight_gpus_per_worker}" \
       "${extraction_args[@]}" \
       --preflight_only=True
   fi
@@ -311,7 +365,7 @@ kubectl --context "${context}" auth whoami >/dev/null
 export CONTEXT="${context}"
 export QUEUE="${queue}"
 export PRIORITY_CLASS="${priority}"
-export CUSTOM_ARGS="worker.count=1 time_limit=${DEFAULT_TIME_LIMIT}"
+export CUSTOM_ARGS="${custom_args}"
 export CMD="${extraction_command}"
 unset IMAGE_TAG || true
 
