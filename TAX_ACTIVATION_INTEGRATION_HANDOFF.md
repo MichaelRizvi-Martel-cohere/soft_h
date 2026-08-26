@@ -16,19 +16,21 @@ experiments. Do not add a parallel JSONL tokenizer or batcher to Tax.
 The shortest C4 path is:
 
 1. `soft_h` freezes the selected public C4 documents once.
-2. Store those documents as Parquet records with a `content` column.
+2. Tax's `scripts/prepare_c4_unpacked.py` tokenizes each document independently
+   with the checkpoint tokenizer, retains at most the first 512 tokens, and
+   writes exactly one native unpacked TFRecord row per document.
 3. Patch the checkpoint run config to use one fixed source:
-   `eval_data_dir_dict = {"drydock": {"gs://.../*.parquet": 1.0}}`.
-4. Fax's existing `get_data_loaders()` and `GPTBalancedDataLoader` invoke
-   Drydock to tokenize, pack, mask, batch, and shard the records with the
-   checkpoint tokenizer.
+   `eval_data_dir_dict = {"unpacked": {"gs://.../unpacked": 1.0}}`.
+4. Fax's existing `get_data_loaders()` and `GPTBalancedDataLoader` pad, label,
+   batch, and shard those rows without packing documents or emitting
+   continuation chunks.
 5. The Tax extraction script only runs `forward_with_hooks_step` and exports
    aligned activations and loader-provided labels/sequence metadata.
 
-Tax's production images already install the `drydock` extra. This route requires
-no changes to `fax_mono`, no new Tax dataloader, no literal prompt, and no new
-`command_data` dataset class or TFRecord build. Dataset selection is a run-config
-override, not model inference code.
+This route requires no changes to `fax_mono`, no new Tax dataloader, no literal
+prompt, and no custom model-side batcher. The small preprocessing script writes
+the existing Fax unpacked TFRecord contract; dataset selection remains a
+run-config override rather than model inference code.
 
 The repositories remain independent. Tax writes a portable directory of numeric
 NPZ shards plus a JSON manifest. `soft_h` reads that directory. There is no
@@ -76,6 +78,13 @@ The exported labels currently mean:
 ### `scripts/extract_activations.py` (new)
 
 - Loads an inference-ready config from a Fax checkpoint.
+- Resolves modern checkpoint weights separately from config loading: it reads
+  `run_config.json` and `arch_config.json` with `state_ckpt=None`, applies Fax's
+  existing generation overrides, and then assigns `config.run.ckpt_dir`. This
+  avoids loading large serialized training metadata such as a prefetched batch
+  and requires no `fax_mono` change.
+- Rejects legacy pre-GDA checkpoints, whose weight path still depends on that
+  training metadata.
 - Runs selected representation-shaped hooks for a bounded number of batches.
 - Masks and flattens activations and token labels consistently.
 - Writes numeric NPZ shards and a versioned JSON manifest through `co.fs`, so
@@ -351,18 +360,20 @@ requires fresh explicit approval.
 
 ### C4 activation extraction
 
-The controlled input is the pinned English C4 validation artifact described by
-its adjacent manifest. The artifact includes a Drydock-compatible Parquet file
-whose only data column is binary `content`. The launcher passes that path as an
-explicit Fax run-config override. Fax's existing evaluation loader tokenizes,
-packs, masks, batches, and shards the records with a 512-token maximum sequence
-length and the checkpoint tokenizer. The extractor does not implement any of
-those data operations.
+The controlled input begins with the pinned English C4 validation JSONL
+artifact described by its adjacent manifest. Before model inference,
+`scripts/prepare_c4_unpacked.py` uses the checkpoint tokenizer to write one
+variable-length native TFRecord row per source document, capped at 512 tokens.
+Fax's existing unpacked evaluation path then pads, labels, batches, and shards
+the rows. It never combines documents or emits a second chunk for a long
+document. With evaluation batch size 2, 10,000 paper samples are exactly 5,000
+model batches.
 
-The `soft_h` consumer derives collision-free input/output unigram through
-quadgram labels from those exported token sequences. It masks positions without
-complete four-token preceding and trailing context, computes one result per
-block-output hook, and averages metrics uniformly across hooks.
+The `soft_h` consumer defaults to collision-free input/output unigram labels,
+the token-level backoff used for the paper's primary analyses. Higher-order
+backoff is an explicit `label_types` selection. It masks positions without the
+requested preceding and trailing context, computes one result per block-output
+hook, and averages metrics uniformly across hooks.
 
 The native path has been exercised end to end on CPU with Fax's existing
 two-layer `tiny_mup` architecture and random initialization. The test used the
@@ -381,23 +392,18 @@ sums soft-bin assignments globally, including per-ngram conditional counts; it
 does not average per-batch entropy values. Online mode writes only
 `results.json`, not activation NPZ shards.
 
-`examples/test_tax_online_entropy_integration.py` exercises this path with the
-same native Drydock C4 input, production tokenizer, four-way simulated CPU
-mesh, and two-layer random `tiny_mup`. It accumulated 104 of 128 token positions
-for both 256-dimensional block outputs. Every entropy, MI, regularity, and
-optimality metric was finite, and the online values matched the existing
-NPZ-based analyzer within numerical tolerance. Unit tests also verify that two
-sequential updates equal one global update and that Tax online mode updates
-every batch without calling the NPZ writer.
+`examples/test_tax_online_entropy_integration.py` exercises the paper-aligned
+unpacked path with the production tokenizer, four-way simulated CPU mesh, and
+two-layer random `tiny_mup`. The latest 20-batch stress run consumed exactly 80
+paper-aligned samples and 2,491 valid unigram positions for each 256-dimensional
+block output. Every entropy, MI, regularity, and optimality metric was finite,
+and online, resumed, and NPZ-based analyses matched within numerical tolerance.
 
-The checkpoint stress test ran 20 native C4 batches through the two-layer random
-model: 2,560 aligned token rows and 2,080 selected entropy positions for each of
-two hooks. It checkpointed after batch 10, restored into new accumulators, and
-matched both uninterrupted accumulation and the 20-shard offline analyzer. The
-first stress attempt exposed that one-token tuple labels were being restored as
-scalars, which split repeated unigram counts across the restart. Checkpoint
-schema version 2 now preserves scalar-versus-tuple label identity, and the
-repeated-label regression plus the full stress test pass.
+The checkpoint stress test checkpoints after batch 10, restores into new
+accumulators, replays the same unpacked data prefix, and matches both
+uninterrupted accumulation and the 20-shard offline analyzer. Earlier Drydock
+testing exposed that one-token tuple labels were being restored as scalars;
+checkpoint schema version 2 preserves scalar-versus-tuple label identity.
 
 For online submissions, the launcher deterministically hashes the Python source
 under `soft_entropy`, stages an exact copy under Tax's `scripts/` image context,
@@ -416,7 +422,7 @@ checkpoint contains only numeric soft-bin counts, conditional n-gram counts,
 reference points, counters, and a run fingerprint; it does not duplicate the
 unchanged Fax model checkpoint. Tax writes `COMPLETE` last and retains only the
 newest complete accumulator checkpoint. Resume reloads the same Fax model,
-restores the accumulator, and replays already-consumed Drydock batches without
+restores the accumulator, and replays already-consumed evaluation batches without
 model inference. A rolling hash of the aligned token prefix must match before
 new forwards run, so changed data order or configuration fails closed.
 `max_batches` remains the total target rather than the number of additional
@@ -439,12 +445,10 @@ optimality metrics were finite; for this integration batch,
 requires local staging rather than accepting the `gs://` directory directly.
 
 The checkpoint has 48 layers with hidden dimension 2,048. A full batch contains
-at most 1,024 activation rows, or 8 MiB per float32 block-output hook and 384 MiB
-for all 48 hooks before small metadata overhead. Even the lower bound of 5,000
-batches for 10,000 source documents would be about 1.88 TiB for all layers;
-Drydock may emit additional sequences for long documents. Scale the number of
-hooks and batches deliberately rather than extrapolating directly to the full
-protocol.
+at most 1,022 valid input/label activation rows because each 512-token source
+document yields at most 511 shifted positions. At 5,000 batches, persisting all
+48 block outputs would still be prohibitive; online accumulation avoids that
+storage.
 
 Hooks retain full `[B, S, D]` representations before masking/export and may need
 more memory than generation alone. TP=8 is therefore a generation baseline,
@@ -456,9 +460,10 @@ branch in Tax.
 
 ### Scientific choices still required
 
-The fixed protocol is English C4 validation, 10,000 frozen documents, 512-token
-maximum context, all transformer block outputs, input/output unigram through
-quadgram labels, 100 bins, and seed 0. The paper does not specify its exact
+The fixed protocol is English C4 validation, 10,000 frozen samples, 512-token
+maximum context, all transformer block outputs, input/output unigram labels,
+100 bins, and seed 0. Higher-order backoff requires explicit opt-in. The paper
+does not specify its exact
 split, sampler, activation hook, special-token policy, or seeds, so the artifact
 and activation manifests record our explicit choices.
 
@@ -466,23 +471,7 @@ Random-model and CI-batch results are integration tests only.
 
 ## Working-tree state
 
-Nothing has been committed or pushed.
-
-Expected Tax changes:
-
-```text
- M tests/fax/hooks.py
-?? scripts/extract_activations.py
-?? tests/fax/extract_activations_test.py
-```
-
-Expected `soft_h` changes before this handoff file:
-
-```text
- M soft_entropy/__init__.py
-?? examples/analyze_tax_activations.py
-?? tests/test_analyze_tax_activations.py
-?? uv.lock
-```
-
-Review the untracked `uv.lock` before including it in a commit.
+The checkpoint/resume baseline is committed locally as `7d73880` in `soft_h`
+and `f0ab51983` in Tax. The paper-aligned unpacked-data changes described above
+are newer working-tree changes and remain uncommitted. Generated result
+artifacts are intentionally excluded from source commits.

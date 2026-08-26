@@ -61,6 +61,30 @@ to port 8000 on the VM.
 `kjobs setup cluster` only installs and validates the presence of the context;
 its `Passed!` message does not prove that an API request can authenticate.
 
+## Prepare the paper-aligned C4 artifact
+
+Run the Tax preprocessing script once per tokenizer. It reads the frozen C4
+JSONL, tokenizes each source document independently, keeps at most its first 512
+tokens, and writes exactly one native unpacked TFRecord row:
+
+```bash
+cd ~/repos/tax
+
+uv run --no-sync python scripts/prepare_c4_unpacked.py \
+  --document_jsonl \
+    gs://cohere-dev/michael-rizvi/soft_h/c4/c4_en_validation_rev1588ec45_seed0_n10000_drydock/documents.jsonl \
+  --output_dir /tmp/c4_en_validation_n10000_r2l255k_unpacked_seq512 \
+  --tokenizer_path \
+    gs://cohere-prod/encoders/releases/0.10.1/r2l255k_chat_agents3_img_remap_response_text_delimit.json \
+  --n_documents 10000 \
+  --max_sequence_length 512
+```
+
+Review `manifest.json`, then upload the complete directory to a unique
+`gs://cohere-dev/` path. The manifest records source indices and source,
+TFRecord, tokenizer, and truncation metadata. Reuse an artifact only for
+checkpoints with the same tokenizer.
+
 ## Preview a job
 
 The launcher is non-submitting by default. Always preview first:
@@ -71,9 +95,9 @@ cd ~/repos/soft_h
 examples/submit_tax_activations.sh \
   --checkpoint \
     s3://us-east-01a/promoted-checkpoints/post-training/priyanka_cohere_com/sft/c5_babylightspeed_agents_expert/pranka0618161154-limpgods/1/ckpt-536 \
-  --dataset-parquet \
-    gs://cohere-dev/michael-rizvi/soft_h/c4/c4_en_validation_rev1588ec45_seed0_n10000_drydock/documents.parquet \
-  --max-batches 1 \
+  --dataset-tfrecord-dir \
+    gs://cohere-dev/michael-rizvi/soft_h/c4/c4_en_validation_n10000_r2l255k_unpacked_seq512 \
+  --sample-count 2 \
   --run-name limpgods_ckpt536_block0
 ```
 
@@ -88,8 +112,9 @@ Defaults:
 - compute: one worker with eight H100s, using Tax's compute YAML;
 - time limit: one hour;
 - hook: `block_0_block_output`;
-- input: an explicit frozen C4 Parquet sample through Fax's Drydock eval loader,
-  with maximum sequence length 512;
+- label type: token-level backoff (`unigram`);
+- input: tokenizer-specific unpacked C4 records, one independently truncated
+  row per source document;
 - tensor parallelism: 4;
 - FSDP parallelism: automatic, which uses the two remaining ways on an
   eight-GPU worker;
@@ -105,8 +130,17 @@ catalog of Fax image tags and the launcher does not choose one. Tax's
 and fills `head.image.tag` and `worker.image.tag`.
 
 The C4 path uses Fax's existing balanced evaluation loader but replaces its
-checkpoint-specific mixture with one fixed Drydock Parquet source. Tax does not
-contain a separate JSONL tokenizer or batcher.
+checkpoint-specific mixture with one fixed unpacked TFRecord source. The
+launcher derives the batch count from the requested sample count and evaluation
+batch size (default 2). Thus 10,000 samples means 5,000 batches at batch size 2
+or 2,500 batches at batch size 4. Tax does not contain a model-side JSONL
+tokenizer or batcher.
+
+Online entropy runs default to input/output unigram labels, matching the
+token-level backoff used by the paper's primary analyses. Higher-order backoff
+is explicit, for example
+`--label-types unigram,bigram,trigram,quadgram`; each additional order retains
+another family of conditional soft-count histograms per hook.
 
 The extractor applies TP to both checkpoint loading and the inference
 fragment, then lets Fax assign unused devices to FSDP. TP is a model-sharding
@@ -234,9 +268,9 @@ launcher. Fax's existing loader creates the shape-2 batches.
 - **TP=4, FSDP=2, batch size 1:** statically preventable from
   `eval_batch_size % (DP * FSDP * EP) == 0`.
 - **Free-text split into positional CLI arguments:** eliminated by passing a
-  shell-safe Parquet URI rather than document text through the launcher.
+  shell-safe TFRecord directory rather than document text through the launcher.
 - **Checkpoint-specific evaluation mixture:** replaced by one explicit C4
-  Drydock source through the native Fax loader.
+  unpacked source through the native Fax loader.
 - **Two- and four-H100 compilation OOM:** not reliably predictable from
   kjobs documentation or CPU config validation. Only a known-good
   model-specific GPU configuration or a real XLA compile/forward probe can
@@ -273,6 +307,9 @@ resource and output specification, repeat the command with `--submit`:
 examples/submit_tax_activations.sh \
   --checkpoint \
     s3://us-east-01a/promoted-checkpoints/post-training/priyanka_cohere_com/sft/c5_babylightspeed_agents_expert/pranka0618161154-limpgods/1/ckpt-536 \
+  --dataset-tfrecord-dir \
+    gs://cohere-dev/michael-rizvi/soft_h/c4/c4_en_validation_n10000_r2l255k_unpacked_seq512 \
+  --sample-count 2 \
   --run-name limpgods_ckpt536_block0 \
   --submit
 ```
@@ -321,28 +358,31 @@ kjobs cancel JOB_NAME --context cw-us-east-04-prod
 
 ## Test online accumulation locally
 
-The online integration test runs a native Drydock C4 batch through a
+The online integration test runs paper-aligned unpacked C4 records through a
 randomly initialized two-layer Fax model, accumulates both block outputs, and
-checks the result against the existing NPZ analyzer:
+checks the result against the existing NPZ analyzer. First prepare a small
+tokenizer-specific artifact with `scripts/prepare_c4_unpacked.py`, then run:
 
 ```bash
 PYTHONPATH="${HOME}/repos/soft_h:${HOME}/repos/tax" \
-  uv run --project "${HOME}/repos/tax" --extra drydock \
-  python "${HOME}/repos/soft_h/examples/test_tax_online_entropy_integration.py"
+  uv run --project "${HOME}/repos/tax" --no-sync \
+  python "${HOME}/repos/soft_h/examples/test_tax_online_entropy_integration.py" \
+  --dataset-tfrecord-dir /tmp/c4_unpacked_tiny
 ```
 
 This is a CPU-only local Ray test and does not submit a Kubernetes job. Success
-requires 128 aligned token rows, 104 positions with complete quadgram context,
-finite metrics for both hooks, numerical agreement between online and offline
-analysis, and no persistent activation shard in the online output.
+requires one unpacked sequence per source document, finite metrics for both
+hooks, numerical agreement between online and offline analysis, and no
+persistent activation shard in the online output.
 
 Use multiple batches to stress the accumulator checkpoint round trip with real
 random-model activations:
 
 ```bash
 PYTHONPATH="${HOME}/repos/soft_h:${HOME}/repos/tax" \
-  uv run --project "${HOME}/repos/tax" --extra drydock \
+  uv run --project "${HOME}/repos/tax" --no-sync \
   python "${HOME}/repos/soft_h/examples/test_tax_online_entropy_integration.py" \
+  --dataset-tfrecord-dir /tmp/c4_unpacked_tiny \
   --n-batches 20
 ```
 
@@ -354,14 +394,14 @@ temporary source copy after `kjobs fax submit` returns.
 
 Online launcher runs checkpoint every 50 completed batches by default. Override
 that with `--checkpoint-every`; zero disables checkpointing. To resume, reuse
-the original run name and total `--max-batches`, then pass the complete numbered
+the original run name and `--sample-count`, then pass the complete numbered
 checkpoint explicitly:
 
 ```bash
 examples/submit_tax_activations.sh \
   ... \
   --online-entropy \
-  --max-batches 250 \
+  --sample-count 500 \
   --run-name <same-run-name> \
   --resume-from \
     gs://cohere-dev/michael-rizvi/soft_h_tax/<same-run-name>/checkpoints/batch_00100

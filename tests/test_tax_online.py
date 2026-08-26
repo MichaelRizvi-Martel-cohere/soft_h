@@ -2,11 +2,15 @@ import copy
 import unittest
 
 import numpy as np
+
 from soft_entropy.tax_online import (
+    DEFAULT_LABEL_TYPES,
     NGRAM_ORDERS,
     TaxActivationAccumulator,
     build_ngram_labels,
 )
+
+ALL_LABEL_TYPES = tuple(NGRAM_ORDERS)
 
 
 def _make_batch(offset: int, scale: float = 1.0) -> dict[str, np.ndarray]:
@@ -48,12 +52,29 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
         np.testing.assert_array_equal(labels["input_quadgram"][0], [10, 11, 12, 13])
         np.testing.assert_array_equal(labels["output_quadgram"][0], [14, 15, 16, 17])
 
+    def test_accumulator_defaults_to_token_level_backoff(self):
+        hook = "block_0_block_output"
+        accumulator = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+
+        self.assertEqual(accumulator.label_types, DEFAULT_LABEL_TYPES)
+        self.assertEqual(accumulator.update(_make_batch(10)), 12)
+        hook_results = accumulator.results()["hooks"][hook]
+        self.assertIn("I(X;Z)/input_unigram", hook_results)
+        self.assertIn("I(X;Z)/output_unigram", hook_results)
+        self.assertNotIn("I(X;Z)/input_bigram", hook_results)
+        self.assertEqual(
+            set(accumulator.diagnostics()["label_cardinality"]),
+            {"input_unigram", "output_unigram"},
+        )
+
     def test_batchwise_updates_equal_one_global_update(self):
         hook = "block_0_block_output"
         first = _make_batch(10, scale=1.0)
         second = _make_batch(100, scale=1.5)
 
-        online = TaxActivationAccumulator((hook,), n_bins=8, seed=7)
+        online = TaxActivationAccumulator(
+            (hook,), n_bins=8, seed=7, label_types=ALL_LABEL_TYPES
+        )
         self.assertEqual(online.update(first), 6)
         self.assertEqual(online.update(second), 6)
 
@@ -61,7 +82,9 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
             key: np.concatenate([first[key], second[key]], axis=0) for key in first
         }
         combined["batch_row"][12:] = 1
-        reference = TaxActivationAccumulator((hook,), n_bins=8, seed=7)
+        reference = TaxActivationAccumulator(
+            (hook,), n_bins=8, seed=7, label_types=ALL_LABEL_TYPES
+        )
         self.assertEqual(reference.update(combined), 12)
 
         online_results = online.results()
@@ -90,7 +113,10 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
             batch[f"activation__{first_hook}"][:, ::-1] + 3
         )
         accumulator = TaxActivationAccumulator(
-            (first_hook, second_hook), n_bins=8, seed=3
+            (first_hook, second_hook),
+            n_bins=8,
+            seed=3,
+            label_types=ALL_LABEL_TYPES,
         )
 
         accumulator.update(batch)
@@ -109,9 +135,7 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
                         for hook in (first_hook, second_hook)
                     ]
                 )
-                self.assertAlmostEqual(
-                    results["mean"][f"I(X;Z)/{label_name}"], mean_mi
-                )
+                self.assertAlmostEqual(results["mean"][f"I(X;Z)/{label_name}"], mean_mi)
                 self.assertAlmostEqual(
                     results["mean"][f"regularity/{label_name}"],
                     mean_mi / results["mean"]["H(Z)"],
@@ -122,9 +146,37 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
                 / results["mean"][f"I(X;Z)/input_{name}"],
             )
 
+    def test_diagnostics_report_label_growth_without_copying_state(self):
+        hooks = ("block_0_block_output", "block_1_block_output")
+        batch = _make_batch(10)
+        batch[f"activation__{hooks[1]}"] = batch[f"activation__{hooks[0]}"][:, ::-1] + 3
+        accumulator = TaxActivationAccumulator(
+            hooks, n_bins=8, seed=3, label_types=ALL_LABEL_TYPES
+        )
+
+        accumulator.update(batch)
+        diagnostics = accumulator.diagnostics()
+
+        self.assertEqual(diagnostics["initialized_hooks"], 2)
+        self.assertEqual(diagnostics["n_samples_per_hook"], 6)
+        self.assertEqual(
+            set(diagnostics["label_cardinality"]),
+            {
+                f"{direction}_{name}"
+                for name in NGRAM_ORDERS
+                for direction in ("input", "output")
+            },
+        )
+        self.assertEqual(
+            diagnostics["total_conditional_vectors"],
+            2 * sum(diagnostics["label_cardinality"].values()),
+        )
+
     def test_model_ratios_are_computed_after_averaging_layer_metrics(self):
         hooks = ("block_0_block_output", "block_1_block_output")
-        accumulator = TaxActivationAccumulator(hooks, n_bins=8, seed=3)
+        accumulator = TaxActivationAccumulator(
+            hooks, n_bins=8, seed=3, label_types=ALL_LABEL_TYPES
+        )
 
         class FakeLayerAccumulator:
             def __init__(self, entropy, input_mi, output_mi):
@@ -134,9 +186,7 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
                     self._metrics[f"I(X;Z)/input_{name}"] = input_mi
                     self._metrics[f"I(X;Z)/output_{name}"] = output_mi
                     self._metrics[f"regularity/input_{name}"] = input_mi / entropy
-                    self._metrics[f"regularity/output_{name}"] = (
-                        output_mi / entropy
-                    )
+                    self._metrics[f"regularity/output_{name}"] = output_mi / entropy
 
             def results(self):
                 return dict(self._metrics)
@@ -231,6 +281,17 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "seed"):
             restored.load_state_dict(accumulator.state_dict())
 
+    def test_checkpoint_rejects_incompatible_label_types(self):
+        hook = "block_0_block_output"
+        accumulator = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
+        accumulator.update(_make_batch(10))
+
+        restored = TaxActivationAccumulator(
+            (hook,), n_bins=8, seed=3, label_types=("bigram",)
+        )
+        with self.assertRaisesRegex(ValueError, "label_types"):
+            restored.load_state_dict(accumulator.state_dict())
+
     def test_checkpoint_rejects_tampered_counts(self):
         hook = "block_0_block_output"
         accumulator = TaxActivationAccumulator((hook,), n_bins=8, seed=3)
@@ -246,7 +307,9 @@ class TaxOnlineAccumulatorTest(unittest.TestCase):
         hook = "block_0_block_output"
         batch = _make_batch(10)
         short_batch = {key: value[:6] for key, value in batch.items()}
-        accumulator = TaxActivationAccumulator((hook,), n_bins=8)
+        accumulator = TaxActivationAccumulator(
+            (hook,), n_bins=8, label_types=ALL_LABEL_TYPES
+        )
 
         self.assertEqual(accumulator.update(short_batch), 0)
         with self.assertRaisesRegex(ValueError, "No positions"):

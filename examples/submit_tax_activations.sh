@@ -10,41 +10,47 @@ readonly DEFAULT_PRIORITY="dev-medium"
 readonly DEFAULT_HOOKS="block_0_block_output"
 readonly DEFAULT_TENSOR_PARALLEL="4"
 readonly DEFAULT_SEQUENCE_LENGTH="512"
+readonly DEFAULT_EVAL_BATCH_SIZE="2"
 readonly DEFAULT_OUTPUT_PREFIX="gs://cohere-dev/michael-rizvi/soft_h_tax"
 readonly DEFAULT_TAX_REPO="${HOME}/repos/tax"
 readonly DEFAULT_TIME_LIMIT="1h"
 readonly DEFAULT_N_BINS="100"
 readonly DEFAULT_SEED="0"
+readonly DEFAULT_LABEL_TYPES="unigram"
 readonly DEFAULT_CHECKPOINT_EVERY="50"
-readonly SOFT_H_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOFT_H_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly SOFT_H_REPO
 readonly RUNTIME_PACKAGE_RELATIVE="scripts/_soft_h_runtime"
 
 usage() {
   cat <<'EOF'
 Usage:
-  submit_tax_activations.sh --checkpoint URI --dataset-parquet URI \
-    --max-batches N --run-name NAME [options]
+  submit_tax_activations.sh --checkpoint URI --dataset-tfrecord-dir URI \
+    --sample-count N --run-name NAME [options]
 
 Prepare a Tax activation-extraction job. On cw-ca-east-01-prod, the launcher
 uses one four-GB200 node with one Ray worker process. By default, this prints
 the complete job specification without submitting it.
 
 Required:
-  --checkpoint URI       Fax checkpoint under s3://us-east-01a/
-  --dataset-parquet URI  Frozen C4 Parquet path/glob under gs://cohere-dev/
-  --max-batches N        Number of Fax eval batches to process
-  --run-name NAME        Unique run name used for the output directory
+  --checkpoint URI           Fax checkpoint under s3://us-east-01a/
+  --dataset-tfrecord-dir URI Tokenizer-specific unpacked C4 directory
+  --sample-count N           Number of paper-aligned C4 samples to process
+  --run-name NAME            Unique run name used for the output directory
 
 Options:
   --hooks LIST           Comma-separated hooks (default: block_0_block_output)
+  --eval-batch-size N    Samples per model forward (default: 2)
   --output-dir URI       Destination under gs://cohere-dev/
   --context CONTEXT      Kubernetes context (default: cw-us-east-04-prod)
   --queue QUEUE          Kueue queue (default: post-training-smifs-queue)
   --priority PRIORITY    Priority class (default: dev-medium)
+  --time-limit DURATION  Job limit as integer minutes or hours (default: 1h)
   --tax-repo PATH        Tax checkout (default: ~/repos/tax)
   --online-entropy       Accumulate entropy online instead of writing NPZ shards
   --n-bins N             Number of soft bins (default: 100)
   --seed N               Soft-bin reference-point seed (default: 0)
+  --label-types LIST      N-gram backoff orders (default: unigram)
   --checkpoint-every N   Save online state every N batches; 0 disables (default: 50)
   --resume-from URI      Resume a numbered accumulator checkpoint for this output
   --submit               Authenticate and submit the displayed specification
@@ -54,15 +60,15 @@ Examples:
   # Preview only.
   examples/submit_tax_activations.sh \
     --checkpoint s3://us-east-01a/promoted-checkpoints/.../ckpt-536 \
-    --dataset-parquet gs://cohere-dev/michael-rizvi/soft_h/c4/.../documents.parquet \
-    --max-batches 1 \
+    --dataset-tfrecord-dir gs://cohere-dev/michael-rizvi/soft_h/c4/.../unpacked \
+    --sample-count 2 \
     --run-name limpgods_ckpt536_block0
 
   # Submit after reviewing the preview.
   examples/submit_tax_activations.sh \
     --checkpoint s3://us-east-01a/promoted-checkpoints/.../ckpt-536 \
-    --dataset-parquet gs://cohere-dev/michael-rizvi/soft_h/c4/.../documents.parquet \
-    --max-batches 1 \
+    --dataset-tfrecord-dir gs://cohere-dev/michael-rizvi/soft_h/c4/.../unpacked \
+    --sample-count 2 \
     --run-name limpgods_ckpt536_block0 \
     --submit
 EOF
@@ -74,18 +80,21 @@ die() {
 }
 
 checkpoint=""
-dataset_parquet=""
-max_batches=""
+dataset_tfrecord_dir=""
+sample_count=""
 run_name=""
 hooks="${DEFAULT_HOOKS}"
+eval_batch_size="${DEFAULT_EVAL_BATCH_SIZE}"
 output_dir=""
 context="${DEFAULT_CONTEXT}"
 queue="${DEFAULT_QUEUE}"
 priority="${DEFAULT_PRIORITY}"
+time_limit="${DEFAULT_TIME_LIMIT}"
 tax_repo="${DEFAULT_TAX_REPO}"
 online_entropy=false
 n_bins="${DEFAULT_N_BINS}"
 seed="${DEFAULT_SEED}"
+label_types="${DEFAULT_LABEL_TYPES}"
 checkpoint_every="${DEFAULT_CHECKPOINT_EVERY}"
 resume_from=""
 submit=false
@@ -97,14 +106,14 @@ while [[ $# -gt 0 ]]; do
       checkpoint="$2"
       shift 2
       ;;
-    --dataset-parquet)
-      [[ $# -ge 2 ]] || die "--dataset-parquet requires a value."
-      dataset_parquet="$2"
+    --dataset-tfrecord-dir)
+      [[ $# -ge 2 ]] || die "--dataset-tfrecord-dir requires a value."
+      dataset_tfrecord_dir="$2"
       shift 2
       ;;
-    --max-batches)
-      [[ $# -ge 2 ]] || die "--max-batches requires a value."
-      max_batches="$2"
+    --sample-count|--document-count)
+      [[ $# -ge 2 ]] || die "$1 requires a value."
+      sample_count="$2"
       shift 2
       ;;
     --run-name)
@@ -115,6 +124,11 @@ while [[ $# -gt 0 ]]; do
     --hooks)
       [[ $# -ge 2 ]] || die "--hooks requires a value."
       hooks="$2"
+      shift 2
+      ;;
+    --eval-batch-size)
+      [[ $# -ge 2 ]] || die "--eval-batch-size requires a value."
+      eval_batch_size="$2"
       shift 2
       ;;
     --output-dir)
@@ -137,6 +151,11 @@ while [[ $# -gt 0 ]]; do
       priority="$2"
       shift 2
       ;;
+    --time-limit)
+      [[ $# -ge 2 ]] || die "--time-limit requires a value."
+      time_limit="$2"
+      shift 2
+      ;;
     --tax-repo)
       [[ $# -ge 2 ]] || die "--tax-repo requires a value."
       tax_repo="$2"
@@ -154,6 +173,11 @@ while [[ $# -gt 0 ]]; do
     --seed)
       [[ $# -ge 2 ]] || die "--seed requires a value."
       seed="$2"
+      shift 2
+      ;;
+    --label-types)
+      [[ $# -ge 2 ]] || die "--label-types requires a value."
+      label_types="$2"
       shift 2
       ;;
     --checkpoint-every)
@@ -181,21 +205,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${checkpoint}" ]] || die "--checkpoint is required."
-[[ -n "${dataset_parquet}" ]] || die "--dataset-parquet is required."
-[[ -n "${max_batches}" ]] || die "--max-batches is required."
+[[ -n "${dataset_tfrecord_dir}" ]] || die "--dataset-tfrecord-dir is required."
+[[ -n "${sample_count}" ]] || die "--sample-count is required."
 [[ -n "${run_name}" ]] || die "--run-name is required."
 [[ "${checkpoint}" =~ ^s3://us-east-01a/[A-Za-z0-9._/-]+$ ]] ||
   die "--checkpoint must be a shell-safe path under s3://us-east-01a/."
-[[ "${dataset_parquet}" =~ ^gs://cohere-dev/[A-Za-z0-9._/*-]+\.parquet$ ]] ||
-  die "--dataset-parquet must be a shell-safe Parquet path under gs://cohere-dev/."
-[[ "${max_batches}" =~ ^[1-9][0-9]*$ ]] || die "--max-batches must be a positive integer."
+[[ "${dataset_tfrecord_dir}" =~ ^gs://cohere-dev/[A-Za-z0-9._/-]+$ ]] ||
+  die "--dataset-tfrecord-dir must be a shell-safe directory under gs://cohere-dev/."
+[[ "${sample_count}" =~ ^[1-9][0-9]*$ ]] ||
+  die "--sample-count must be a positive integer."
+[[ "${eval_batch_size}" =~ ^[1-9][0-9]*$ ]] ||
+  die "--eval-batch-size must be a positive integer."
+(( sample_count % eval_batch_size == 0 )) ||
+  die "--sample-count must be divisible by eval batch size ${eval_batch_size}."
+max_batches=$((sample_count / eval_batch_size))
 [[ "${run_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "--run-name contains unsupported characters."
 [[ "${hooks}" =~ ^[A-Za-z0-9_,]+$ ]] || die "--hooks must be a comma-separated list of hook names."
+wire_hooks="${hooks//,/+}"
 [[ "${context}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--context contains unsupported characters."
 [[ "${queue}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--queue contains unsupported characters."
 [[ "${priority}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--priority contains unsupported characters."
-[[ "${n_bins}" =~ ^[1-9][0-9]*$ ]] && (( n_bins >= 2 )) || die "--n-bins must be an integer of at least 2."
+[[ "${time_limit}" =~ ^[1-9][0-9]*(m|h)$ ]] ||
+  die "--time-limit must be a positive integer number of minutes or hours."
+if [[ ! "${n_bins}" =~ ^[1-9][0-9]*$ ]] || (( n_bins < 2 )); then
+  die "--n-bins must be an integer of at least 2."
+fi
 [[ "${seed}" =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer."
+[[ "${label_types}" =~ ^[a-z]+(,[a-z]+)*$ ]] ||
+  die "--label-types must be a comma-separated list of n-gram backoff orders."
+wire_label_types="${label_types//,/+}"
 [[ "${checkpoint_every}" =~ ^[0-9]+$ ]] || die "--checkpoint-every must be a non-negative integer."
 
 if [[ -z "${output_dir}" ]]; then
@@ -239,21 +277,21 @@ extraction_args=(
   uv run --no-sync python scripts/extract_activations.py
   "--ckpt_path=${checkpoint}"
   "--output_dir=${output_dir}"
-  "--hooks=${hooks}"
+  "--hooks=${wire_hooks}"
   "--max_batches=${max_batches}"
   "--sample_config_path=${sample_config_path}"
   "--n_tensor_parallel=${DEFAULT_TENSOR_PARALLEL}"
-  "--eval_data_path=${dataset_parquet}"
+  "--eval_data_path=${dataset_tfrecord_dir}"
+  "--eval_data_type=unpacked"
+  "--eval_batch_size=${eval_batch_size}"
   "--max_sequence_length=${DEFAULT_SEQUENCE_LENGTH}"
 )
-n_gpus=8
 preflight_workers=1
 preflight_gpus_per_worker=8
 worker_description="1 node x 8 GPUs"
 fsdp_description="automatic (2 ways on the requested 8 GPUs)"
-custom_args="worker.count=1 time_limit=${DEFAULT_TIME_LIMIT}"
+custom_args="worker.count=1 time_limit=${time_limit}"
 if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
-  n_gpus=4
   preflight_workers=1
   preflight_gpus_per_worker=4
   custom_args+=" worker.cpu=64 worker.gpu=4"
@@ -271,8 +309,10 @@ if [[ "${online_entropy}" == true ]]; then
     "--online_entropy=True"
     "--n_bins=${n_bins}"
     "--seed=${seed}"
+    "--label_types=${wire_label_types}"
     "--soft_h_package_sha256=${soft_h_package_sha256}"
     "--checkpoint_every=${checkpoint_every}"
+    "--telemetry_every=1"
   )
   if [[ -n "${resume_from}" ]]; then
     extraction_args+=("--resume_from=${resume_from}")
@@ -291,10 +331,12 @@ Tax activation extraction
   checkpoint : ${checkpoint}
   output     : ${output_dir}
   hooks      : ${hooks}
-  input      : ${dataset_parquet} (Fax Drydock eval loader)
-  batches    : ${max_batches}
+  input      : ${dataset_tfrecord_dir} (Fax unpacked eval loader)
+  samples    : ${sample_count}
+  batches    : ${max_batches} (${eval_batch_size} samples each)
   mode       : $([[ "${online_entropy}" == true ]] && printf 'online entropy' || printf 'raw activation export')
   bins/seed  : ${n_bins}/${seed}
+  label types: ${label_types}
   checkpoint : every ${checkpoint_every} batches
   resume     : ${resume_from:-fresh run}
   soft_h sha : ${soft_h_package_sha256:-not packaged}
@@ -305,7 +347,7 @@ Tax activation extraction
   context    : ${context}
   queue      : ${queue}
   priority   : ${priority}
-  time limit : ${DEFAULT_TIME_LIMIT}
+  time limit : ${time_limit}
   worker     : ${worker_description}
   image      : build current Tax checkout with kjobs-generated timestamp tag
   command    : ${extraction_command}
@@ -338,7 +380,7 @@ if [[ "${online_entropy}" == true ]]; then
   printf '\nStaged soft_h package %s for the Tax image build.\n' "${staged_sha}"
 fi
 
-printf '\nRunning checkpoint, mesh, tokenizer, and C4-batch preflight on CPU...\n'
+printf '\nRunning checkpoint, mesh, tokenizer, and paper-aligned C4 preflight on CPU...\n'
 (
   cd "${tax_repo}"
   if [[ "${online_entropy}" == true ]]; then

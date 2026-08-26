@@ -1,4 +1,4 @@
-"""Run Tax online entropy accumulation on native C4 with a tiny random Fax model."""
+"""Run paper-aligned C4 entropy accumulation on a tiny random Fax model."""
 
 from __future__ import annotations
 
@@ -12,11 +12,6 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
-
-DEFAULT_C4_PARQUET = (
-    "gs://cohere-dev/michael-rizvi/soft_h/c4/"
-    "c4_en_validation_rev1588ec45_seed0_n10000_drydock/documents.parquet"
-)
 
 
 def _assert_results_are_finite(results: dict, hooks: tuple[str, ...]) -> None:
@@ -48,11 +43,11 @@ def _assert_results_match(actual: dict, expected: dict, hooks: tuple[str, ...]) 
 
 def run(
     tax_repo: Path,
-    dataset_parquet: str,
+    dataset_tfrecord_dir: str,
     output_dir: Path | None,
     n_batches: int = 1,
 ) -> dict:
-    """Execute native C4 batches and compare online, resumed, and offline results."""
+    """Execute unpacked C4 batches and compare online, resumed, and offline results."""
     if n_batches < 1:
         raise ValueError(f"n_batches must be positive, got {n_batches}.")
     soft_h_repo = Path(__file__).resolve().parents[1]
@@ -76,10 +71,11 @@ def run(
         write_online_checkpoint,
         write_results,
     )
-    from soft_entropy.tax_online import TaxActivationAccumulator
     from tests.fax.hooks import load_config
 
-    source = {"drydock": {dataset_parquet: 1.0}}
+    from soft_entropy.tax_online import TaxActivationAccumulator
+
+    source = {"unpacked": {dataset_tfrecord_dir: 1.0}}
     hooks = ("block_0_block_output", "block_1_block_output")
     config = load_config(
         arch_overrides={"layer_switch": 2, "vocab_size": 50261},
@@ -100,6 +96,18 @@ def run(
     )
     _, eval_loader, _ = get_data_loaders(config)
     batches = [next(eval_loader) for _ in range(n_batches)]
+    for batch_index, batch in enumerate(batches):
+        mask = np.asarray(batch["mask"], dtype=np.bool_)
+        sequence_ids = np.asarray(batch["sequence_ids"])
+        if mask.shape != (4, 32):
+            raise AssertionError(
+                f"Batch {batch_index} has shape {mask.shape}, expected (4, 32)."
+            )
+        for row in range(mask.shape[0]):
+            if np.unique(sequence_ids[row][mask[row]]).size != 1:
+                raise AssertionError(
+                    f"Unpacked batch {batch_index} row {row} contains multiple documents."
+                )
 
     with (
         RayManager(config=config, ray_init_timer=GlobalTimer()) as ray_manager,
@@ -146,16 +154,18 @@ def run(
                 _update_data_prefix_hash(replay_digest, next(replay_loader))
             if replay_digest.hexdigest() != data_prefix_digest.hexdigest():
                 raise AssertionError(
-                    "A fresh Drydock loader did not reproduce the checkpoint prefix."
+                    "A fresh unpacked loader did not reproduce the checkpoint prefix."
                 )
             run_fingerprint = {
                 "checkpoint": "random_init:tiny_mup",
                 "hooks": list(hooks),
-                "eval_data_path": dataset_parquet,
+                "eval_data_path": dataset_tfrecord_dir,
+                "eval_data_type": "unpacked",
                 "sequence_length": 32,
                 "tokenizer_path": config.run.tokenizer_path,
                 "n_bins": 16,
                 "seed": 0,
+                "label_types": ["unigram"],
                 "soft_h_package_sha256": "integration-test",
             }
             final_checkpoint = write_online_checkpoint(
@@ -191,11 +201,15 @@ def run(
             "schema_version": 2,
             "checkpoint": "random_init:tiny_mup",
             "mode": "online_entropy",
-            "eval_data_path": dataset_parquet,
+            "input_source": "fixed_unpacked_eval",
+            "eval_data_path": dataset_tfrecord_dir,
+            "eval_data_type": "unpacked",
             "sequence_length": 32,
             "n_bins": 16,
             "seed": 0,
+            "label_types": ["unigram"],
             "n_batches": n_batches,
+            "n_documents": n_batches * 4,
             "total_samples": total_samples,
             "total_selected_samples": selected_samples,
             "final_checkpoint": final_checkpoint,
@@ -249,8 +263,9 @@ def run(
                         "sequence_id",
                         "position",
                     ],
-                    "input_source": "fixed_drydock_eval",
-                    "eval_data_path": dataset_parquet,
+                    "input_source": "fixed_unpacked_eval",
+                    "eval_data_path": dataset_tfrecord_dir,
+                    "eval_data_type": "unpacked",
                     "sequence_length": 32,
                     "tokenizer_path": config.run.tokenizer_path,
                     "shards": shard_specs,
@@ -275,12 +290,16 @@ def main() -> None:
         type=Path,
         default=Path.home() / "repos" / "tax",
     )
-    parser.add_argument("--dataset-parquet", default=DEFAULT_C4_PARQUET)
+    parser.add_argument(
+        "--dataset-tfrecord-dir",
+        required=True,
+        help="Local paper-aligned unpacked TFRecord directory.",
+    )
     parser.add_argument(
         "--n-batches",
         type=int,
         default=1,
-        help="Number of C4 batches to run; values above one exercise checkpoint/resume.",
+        help="Number of four-document C4 batches; values above one exercise resume.",
     )
     parser.add_argument(
         "--output-dir",
@@ -294,7 +313,7 @@ def main() -> None:
         raise FileNotFoundError(f"Tax checkout not found at {tax_repo}.")
     if args.output_dir is not None and args.output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output_dir}.")
-    run(tax_repo, args.dataset_parquet, args.output_dir, args.n_batches)
+    run(tax_repo, args.dataset_tfrecord_dir, args.output_dir, args.n_batches)
 
 
 if __name__ == "__main__":

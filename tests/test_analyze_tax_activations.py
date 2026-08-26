@@ -58,16 +58,30 @@ class AnalyzeTaxActivationsTest(unittest.TestCase):
 
             first = analyze(str(root), n_bins=8, seed=7)
             second = analyze(str(root), n_bins=8, seed=7)
+            all_orders = analyze(
+                str(root),
+                n_bins=8,
+                seed=7,
+                label_types="unigram,bigram,trigram,quadgram",
+            )
 
         self.assertEqual(first, second)
         hook_result = first["hooks"]["block_0_block_output"]
         self.assertEqual(hook_result["dimension"], 4)
-        self.assertEqual(hook_result["n_samples"], 6)
+        self.assertEqual(hook_result["n_samples"], 12)
+        self.assertEqual(first["label_types"], ["unigram"])
         self.assertTrue(0 <= hook_result["H(Z)"] <= 1)
-        for ngram in ("unigram", "bigram", "trigram", "quadgram"):
-            self.assertTrue(np.isfinite(hook_result[f"I(X;Z)/input_{ngram}"]))
-            self.assertTrue(np.isfinite(hook_result[f"I(X;Z)/output_{ngram}"]))
-            self.assertTrue(np.isfinite(hook_result[f"optimality/{ngram}"]))
+        self.assertTrue(np.isfinite(hook_result["I(X;Z)/input_unigram"]))
+        self.assertNotIn("I(X;Z)/input_bigram", hook_result)
+        self.assertEqual(
+            all_orders["hooks"]["block_0_block_output"]["n_samples"],
+            6,
+        )
+        self.assertTrue(
+            np.isfinite(
+                all_orders["hooks"]["block_0_block_output"]["I(X;Z)/input_quadgram"]
+            )
+        )
 
     def test_rejects_shard_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

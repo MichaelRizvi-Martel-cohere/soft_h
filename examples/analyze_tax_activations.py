@@ -8,10 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from soft_entropy.tax_online import TaxActivationAccumulator
+
+from soft_entropy.tax_online import (
+    DEFAULT_LABEL_TYPES,
+    TaxActivationAccumulator,
+    parse_label_types,
+)
 
 _SCHEMA_VERSION = 2
-_MANIFEST_FIELDS = {
+_REQUIRED_MANIFEST_FIELDS = {
     "schema_version",
     "checkpoint",
     "hooks",
@@ -26,6 +31,7 @@ _MANIFEST_FIELDS = {
     "tokenizer_path",
     "total_sequences",
 }
+_OPTIONAL_MANIFEST_FIELDS = {"eval_data_type", "label_types"}
 _SHARD_FIELDS = {"file", "n_samples", "hook_dimensions"}
 
 
@@ -36,8 +42,9 @@ def _load_manifest(activation_dir: Path) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         raise TypeError("Activation manifest must be a JSON object.")
 
-    missing = _MANIFEST_FIELDS - manifest.keys()
-    unexpected = manifest.keys() - _MANIFEST_FIELDS
+    allowed_fields = _REQUIRED_MANIFEST_FIELDS | _OPTIONAL_MANIFEST_FIELDS
+    missing = _REQUIRED_MANIFEST_FIELDS - manifest.keys()
+    unexpected = manifest.keys() - allowed_fields
     if missing or unexpected:
         raise ValueError(
             f"Invalid manifest fields: missing={sorted(missing)}, unexpected={sorted(unexpected)}."
@@ -74,6 +81,7 @@ def analyze(
     activation_dir: str,
     n_bins: int = 100,
     seed: int = 0,
+    label_types: str | tuple[str, ...] | list[str] = DEFAULT_LABEL_TYPES,
 ) -> dict[str, Any]:
     """Stream an exported Tax activation dataset into one accumulator per hook."""
     if n_bins < 2:
@@ -82,7 +90,13 @@ def analyze(
     root = Path(activation_dir)
     manifest = _load_manifest(root)
     hooks = manifest["hooks"]
-    accumulator = TaxActivationAccumulator(hooks, n_bins=n_bins, seed=seed)
+    parsed_label_types = parse_label_types(label_types)
+    accumulator = TaxActivationAccumulator(
+        hooks,
+        n_bins=n_bins,
+        seed=seed,
+        label_types=parsed_label_types,
+    )
 
     for shard_spec in manifest["shards"]:
         shard_path = _resolve_shard(root, shard_spec["file"])
@@ -114,17 +128,19 @@ def analyze(
             }
             if accumulator.update(arrays) == 0:
                 raise ValueError(
-                    f"Shard {shard_path} has no positions with complete quadgram context."
+                    f"Shard {shard_path} has no positions with the requested n-gram context."
                 )
     accumulated_results = accumulator.results()
     return {
         "schema_version": _SCHEMA_VERSION,
         "checkpoint": manifest["checkpoint"],
         "eval_data_path": manifest["eval_data_path"],
+        "eval_data_type": manifest.get("eval_data_type"),
         "tokenizer_path": manifest["tokenizer_path"],
         "sequence_length": manifest["sequence_length"],
         "n_bins": n_bins,
         "seed": seed,
+        "label_types": list(parsed_label_types),
         **accumulated_results,
     }
 
@@ -137,13 +153,23 @@ def main() -> None:
     parser.add_argument("--n-bins", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--label-types",
+        default="unigram",
+        help="Comma-separated n-gram backoff orders (default: unigram).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optional JSON output path; prints to stdout otherwise.",
     )
     args = parser.parse_args()
 
-    results = analyze(args.activation_dir, n_bins=args.n_bins, seed=args.seed)
+    results = analyze(
+        args.activation_dir,
+        n_bins=args.n_bins,
+        seed=args.seed,
+        label_types=args.label_types,
+    )
     rendered = json.dumps(results, indent=2, sort_keys=True) + "\n"
     if args.output is None:
         print(rendered, end="")

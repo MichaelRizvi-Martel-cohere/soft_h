@@ -9,8 +9,9 @@ import numpy as np
 from soft_entropy.accumulator import SoftEntropyAccumulator
 
 NGRAM_ORDERS = {"unigram": 1, "bigram": 2, "trigram": 3, "quadgram": 4}
+DEFAULT_LABEL_TYPES = ("unigram",)
 _ACTIVATION_PREFIX = "activation__"
-_STATE_SCHEMA_VERSION = 1
+_STATE_SCHEMA_VERSION = 2
 _METADATA_KEYS = {
     "input_token",
     "output_token",
@@ -20,18 +21,45 @@ _METADATA_KEYS = {
 }
 
 
+def parse_label_types(
+    label_types: str | tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Normalize and validate selected n-gram backoff orders."""
+    if isinstance(label_types, str):
+        parsed = tuple(
+            label_type.strip()
+            for label_type in label_types.replace("+", ",").split(",")
+            if label_type.strip()
+        )
+    else:
+        parsed = tuple(label_types)
+    if not parsed:
+        raise ValueError("At least one label type must be provided.")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"Label types must be unique, got {parsed}.")
+    unsupported = set(parsed) - NGRAM_ORDERS.keys()
+    if unsupported:
+        raise ValueError(
+            f"Label types must be drawn from {list(NGRAM_ORDERS)}, "
+            f"got {sorted(unsupported)}."
+        )
+    return parsed
+
+
 def build_ngram_labels(
     input_token: np.ndarray,
     output_token: np.ndarray,
     batch_row: np.ndarray,
     sequence_id: np.ndarray,
     position: np.ndarray,
+    label_types: tuple[str, ...] | list[str] = tuple(NGRAM_ORDERS),
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Select positions with complete quadgram context and build tuple labels."""
+    """Select positions with the requested context and build tuple labels."""
+    parsed_label_types = parse_label_types(label_types)
     selected_indices: list[int] = []
     label_rows: dict[str, list[list[int]]] = {
         f"{direction}_{name}": []
-        for name in NGRAM_ORDERS
+        for name in parsed_label_types
         for direction in ("input", "output")
     }
     sequence_keys = np.stack([batch_row, sequence_id], axis=-1)
@@ -56,10 +84,11 @@ def build_ngram_labels(
                 f"Sequence {current_sequence_key.tolist()} has inconsistent shifted token labels."
             )
         tokens = np.concatenate([sequence_inputs, sequence_outputs[-1:]])
-        max_order = max(NGRAM_ORDERS.values())
+        max_order = max(NGRAM_ORDERS[name] for name in parsed_label_types)
         for token_position in range(max_order - 1, tokens.size - max_order):
             selected_indices.append(int(sequence_indices[token_position]))
-            for name, order in NGRAM_ORDERS.items():
+            for name in parsed_label_types:
+                order = NGRAM_ORDERS[name]
                 label_rows[f"input_{name}"].append(
                     tokens[token_position - order + 1 : token_position + 1].tolist()
                 )
@@ -81,6 +110,7 @@ class TaxActivationAccumulator:
         n_bins: int = 100,
         seed: int = 0,
         backend: str = "numpy",
+        label_types: str | tuple[str, ...] | list[str] = DEFAULT_LABEL_TYPES,
     ) -> None:
         if not hooks:
             raise ValueError("At least one hook must be provided.")
@@ -93,6 +123,7 @@ class TaxActivationAccumulator:
         self.n_bins = n_bins
         self.seed = seed
         self.backend = backend
+        self.label_types = parse_label_types(label_types)
         self._accumulators: dict[str, SoftEntropyAccumulator] = {}
         self._sample_counts = {hook: 0 for hook in self.hooks}
 
@@ -136,6 +167,7 @@ class TaxActivationAccumulator:
             batch_row,
             sequence_id,
             position,
+            self.label_types,
         )
         if selected_indices.size == 0:
             return 0
@@ -173,6 +205,33 @@ class TaxActivationAccumulator:
 
         return int(selected_indices.size)
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Return compact accumulator-growth telemetry without copying counts."""
+        if not self._accumulators:
+            return {
+                "initialized_hooks": 0,
+                "n_samples_per_hook": 0,
+                "label_cardinality": {},
+                "total_conditional_vectors": 0,
+            }
+
+        first_accumulator = self._accumulators[next(iter(self._accumulators))]
+        label_cardinality = {
+            set_name: len(counts_by_label)
+            for set_name, counts_by_label in first_accumulator._label_counts.items()
+        }
+        total_conditional_vectors = sum(
+            len(counts_by_label)
+            for accumulator in self._accumulators.values()
+            for counts_by_label in accumulator._label_counts.values()
+        )
+        return {
+            "initialized_hooks": len(self._accumulators),
+            "n_samples_per_hook": first_accumulator.n_samples,
+            "label_cardinality": label_cardinality,
+            "total_conditional_vectors": total_conditional_vectors,
+        }
+
     def state_dict(self) -> dict[str, Any]:
         """Return a safe numeric checkpoint of every hook accumulator."""
         missing_hooks = set(self.hooks) - self._accumulators.keys()
@@ -186,6 +245,7 @@ class TaxActivationAccumulator:
             "n_bins": self.n_bins,
             "seed": self.seed,
             "backend": self.backend,
+            "label_types": list(self.label_types),
             "sample_counts": dict(self._sample_counts),
             "accumulators": {
                 hook: self._accumulators[hook].state_dict() for hook in self.hooks
@@ -200,6 +260,7 @@ class TaxActivationAccumulator:
             "n_bins",
             "seed",
             "backend",
+            "label_types",
             "sample_counts",
             "accumulators",
         }
@@ -213,6 +274,7 @@ class TaxActivationAccumulator:
             "n_bins": self.n_bins,
             "seed": self.seed,
             "backend": self.backend,
+            "label_types": list(self.label_types),
         }
         for name, expected in expected_metadata.items():
             if state[name] != expected:
@@ -271,7 +333,7 @@ class TaxActivationAccumulator:
         missing_hooks = set(self.hooks) - self._accumulators.keys()
         if missing_hooks:
             raise ValueError(
-                "No positions with complete quadgram context were accumulated for "
+                "No positions with the requested n-gram context were accumulated for "
                 f"hooks {sorted(missing_hooks)}."
             )
 
@@ -279,7 +341,7 @@ class TaxActivationAccumulator:
         for hook in self.hooks:
             accumulator = self._accumulators[hook]
             metrics = accumulator.results()
-            for name in NGRAM_ORDERS:
+            for name in self.label_types:
                 input_mi = metrics[f"I(X;Z)/input_{name}"]
                 output_mi = metrics[f"I(X;Z)/output_{name}"]
                 metrics[f"optimality/{name}"] = (
@@ -298,11 +360,10 @@ class TaxActivationAccumulator:
             and not key.startswith(("regularity/", "optimality/"))
         ]
         mean_metrics = {
-            key: sum(hook_results[hook][key] for hook in self.hooks)
-            / len(self.hooks)
+            key: sum(hook_results[hook][key] for hook in self.hooks) / len(self.hooks)
             for key in base_metric_keys
         }
-        for name in NGRAM_ORDERS:
+        for name in self.label_types:
             for direction in ("input", "output"):
                 label_name = f"{direction}_{name}"
                 mutual_information = mean_metrics[f"I(X;Z)/{label_name}"]
