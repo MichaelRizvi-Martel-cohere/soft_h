@@ -51,6 +51,10 @@ Options:
   --n-bins N             Number of soft bins (default: 100)
   --seed N               Soft-bin reference-point seed (default: 0)
   --label-types LIST      N-gram backoff orders (default: unigram)
+  --sample-config-path P Fax inference fragment relative to the Tax checkout.
+                         Use configs/sample.logit_compare.run.fragment for a
+                         cross-backend agreement gate; it selects jax_native
+                         attention so the forward pass matches HF eager.
   --checkpoint-every N   Save online state every N batches; 0 disables (default: 50)
   --resume-from URI      Resume a numbered accumulator checkpoint for this output
   --submit               Authenticate and submit the displayed specification
@@ -95,6 +99,7 @@ online_entropy=false
 n_bins="${DEFAULT_N_BINS}"
 seed="${DEFAULT_SEED}"
 label_types="${DEFAULT_LABEL_TYPES}"
+sample_config_path=""
 checkpoint_every="${DEFAULT_CHECKPOINT_EVERY}"
 resume_from=""
 submit=false
@@ -178,6 +183,11 @@ while [[ $# -gt 0 ]]; do
     --label-types)
       [[ $# -ge 2 ]] || die "--label-types requires a value."
       label_types="$2"
+      shift 2
+      ;;
+    --sample-config-path)
+      [[ $# -ge 2 ]] || die "--sample-config-path requires a value."
+      sample_config_path="$2"
       shift 2
       ;;
     --checkpoint-every)
@@ -264,14 +274,26 @@ else
   die "kjobs is not installed."
 fi
 
-sample_config_path="configs/sample.run.fragment"
-attention_impl="fax_fa3"
-if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
-  sample_config_path="configs/sample.gb200.run.fragment"
-  attention_impl="fax_fa4"
+if [[ -z "${sample_config_path}" ]]; then
+  sample_config_path="configs/sample.run.fragment"
+  if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
+    sample_config_path="configs/sample.gb200.run.fragment"
+  fi
+fi
+if [[ ! "${sample_config_path}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || "${sample_config_path}" == *..* ]]; then
+  die "--sample-config-path must be a shell-safe relative path inside the Tax checkout."
 fi
 [[ -f "${tax_repo}/${sample_config_path}" ]] ||
   die "Tax sample config not found at ${tax_repo}/${sample_config_path}."
+
+# Report the kernel the fragment actually selects; the entropy gate compares it
+# against the Hugging Face side, so the preview must not restate a stale default.
+attention_impl="hardware default"
+while IFS= read -r fragment_line; do
+  if [[ "${fragment_line}" =~ ^[[:space:]]*performance\.attention_impl[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+    attention_impl="${BASH_REMATCH[1]}"
+  fi
+done <"${tax_repo}/${sample_config_path}"
 
 extraction_args=(
   uv run --no-sync python scripts/extract_activations.py
@@ -341,6 +363,7 @@ Tax activation extraction
   resume     : ${resume_from:-fresh run}
   soft_h sha : ${soft_h_package_sha256:-not packaged}
   max seq    : ${DEFAULT_SEQUENCE_LENGTH}
+  fragment   : ${sample_config_path}
   attention  : ${attention_impl}
   tensor par : ${DEFAULT_TENSOR_PARALLEL}
   FSDP       : ${fsdp_description}

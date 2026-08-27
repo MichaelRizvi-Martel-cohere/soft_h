@@ -1,0 +1,11 @@
+worker:
+  count: 1
+  cpu: 16
+  memory: 128Gi
+  gpu: 1
+  image:
+    repository: us-central1-docker.pkg.dev/cohere-artifacts/cohere/vllm-nvidia
+    tag: v0.19.1b04
+
+app: soft-h-entropy-comparison
+type: pytorch

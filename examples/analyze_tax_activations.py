@@ -31,7 +31,15 @@ _REQUIRED_MANIFEST_FIELDS = {
     "tokenizer_path",
     "total_sequences",
 }
-_OPTIONAL_MANIFEST_FIELDS = {"eval_data_type", "label_types"}
+_OPTIONAL_MANIFEST_FIELDS = {
+    "eval_data_type",
+    "label_types",
+    "attention_impl",
+    "quantize_params",
+    "quantize_activations",
+    "quantize_residuals",
+    "use_fp8_gemm",
+}
 _SHARD_FIELDS = {"file", "n_samples", "hook_dimensions"}
 
 

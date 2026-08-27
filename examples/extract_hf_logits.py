@@ -37,31 +37,35 @@ def _validate_args(
 
 
 def _load_npz(path: str) -> dict[str, np.ndarray]:
-    from co import fs
+    import fsspec
 
-    with fs.open(path, "rb") as source:
+    with fsspec.open(path, "rb").open() as source:
         payload = source.read()
     with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
         return {name: archive[name] for name in archive.files}
 
 
 def _write_npz(path: str, arrays: dict[str, np.ndarray]) -> None:
-    from co import fs
+    import fsspec
+    from fsspec.core import url_to_fs
 
-    if fs.exists(path):
+    filesystem, filesystem_path = url_to_fs(path)
+    if filesystem.exists(filesystem_path):
         raise FileExistsError(f"Refusing to overwrite existing artifact {path!r}.")
     buffer = io.BytesIO()
     np.savez(buffer, **arrays)
-    with fs.open(path, "wb") as output:
+    with fsspec.open(path, "wb").open() as output:
         output.write(buffer.getvalue())
 
 
 def _write_json(path: str, payload: dict[str, Any]) -> None:
-    from co import fs
+    import fsspec
+    from fsspec.core import url_to_fs
 
-    if fs.exists(path):
+    filesystem, filesystem_path = url_to_fs(path)
+    if filesystem.exists(filesystem_path):
         raise FileExistsError(f"Refusing to overwrite existing artifact {path!r}.")
-    with fs.open(path, "w") as output:
+    with fsspec.open(path, "w").open() as output:
         json.dump(payload, output, indent=2, sort_keys=True)
         output.write("\n")
 
@@ -92,8 +96,6 @@ def main(
     attention_implementation: str = "eager",
 ) -> None:
     """Load pinned public Command R7B and evaluate the Fax-exported token batch."""
-    from co import fs
-
     _validate_args(model_id, revision, fax_logits_path, output_dir)
     if attention_implementation != "eager":
         raise ValueError("The identity gate requires attention_implementation='eager'.")
@@ -165,9 +167,9 @@ def main(
         fax_arrays["selected_positions"],
     )
 
-    fs.makedirs(output_dir)
-    logits_path = fs.path.join(output_dir, "hf_logits.npz")
-    manifest_path = fs.path.join(output_dir, "hf_manifest.json")
+    output_dir = output_dir.rstrip("/")
+    logits_path = f"{output_dir}/hf_logits.npz"
+    manifest_path = f"{output_dir}/hf_manifest.json"
     _write_npz(
         logits_path,
         {

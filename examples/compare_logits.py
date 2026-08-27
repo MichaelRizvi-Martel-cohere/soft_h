@@ -32,6 +32,24 @@ def _cosine_rows(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return numerator / denominator
 
 
+def _valid_prediction_mask(fax: dict[str, np.ndarray]) -> np.ndarray:
+    """Exclude positions whose next-token target is padding."""
+    n_distributions = fax["logits"].shape[0]
+    if "selected_target_tokens" not in fax:
+        return np.ones(n_distributions, dtype=np.bool_)
+    target_tokens = np.asarray(fax["selected_target_tokens"])
+    if target_tokens.shape != (n_distributions,):
+        raise ValueError(
+            "selected_target_tokens must align with the selected logit distributions."
+        )
+    valid = target_tokens != 0
+    if not valid.any():
+        raise ValueError(
+            "Fax artifact contains no valid next-token prediction positions."
+        )
+    return valid
+
+
 def compute_metrics(
     fax_logits: np.ndarray, hf_logits: np.ndarray, top_k: int = 10
 ) -> dict[str, Any]:
@@ -119,7 +137,9 @@ def compare(
     for key in ("selected_rows", "selected_positions"):
         if key not in fax or key not in hf or not np.array_equal(fax[key], hf[key]):
             raise ValueError(f"Fax and Hugging Face artifacts disagree on {key}.")
-    metrics = compute_metrics(fax["logits"], hf["logits"], top_k=top_k)
+    valid = _valid_prediction_mask(fax)
+    metrics = compute_metrics(fax["logits"][valid], hf["logits"][valid], top_k=top_k)
+    metrics["n_excluded_masked_positions"] = int((~valid).sum())
 
     if output_path is not None:
         from co import fs

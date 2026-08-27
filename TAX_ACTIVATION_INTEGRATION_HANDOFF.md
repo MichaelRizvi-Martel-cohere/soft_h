@@ -1,40 +1,58 @@
 # Tax activation extraction to soft-entropy: project handoff
 
-Last updated: 2026-08-21
+Last updated: 2026-08-26
 
 ## Goal
 
-Use Fax/Tax to load a model checkpoint, run model inference with intermediate
-activation hooks, export aligned activation and token-label tensors, and consume
-those tensors in `soft_h` to estimate soft entropy and mutual information.
+The long-term goal is to use Fax/Tax to load internal Cohere checkpoints, run
+model inference with intermediate activation hooks, and use `soft_h` to estimate
+soft entropy and mutual information without persisting prohibitively large
+activation datasets.
+
+The immediate objective is a final sanity check between two versions of the same
+model: one public Hugging Face release and one internal Cohere Fax checkpoint.
+Both backends must process exactly the same token IDs with the same estimator
+configuration. If their per-layer entropy metrics agree within a prespecified
+tolerance, this validates that entropy estimation in the Cohere Tax/Fax setup is
+faithful to the previous Hugging Face `soft_h` code path.
+
+This is an integration-equivalence test, not a new scientific result. The
+current paired models are internal `c3_7B_12-2024_command_release` checkpoint
+499 and public `CohereLabs/c4ai-command-r7b-12-2024` revision
+`4f3d0aa6856e322f2f4480fe65420d5d53d297b8`.
 
 ## Native data path decision
 
 Always use Fax's existing evaluation pipeline for dataset-backed activation
 experiments. Do not add a parallel JSONL tokenizer or batcher to Tax.
 
-The shortest C4 path is:
+The current C4 path is:
 
-1. `soft_h` freezes the selected public C4 documents once.
-2. Tax's `scripts/prepare_c4_unpacked.py` tokenizes each document independently
-   with the checkpoint tokenizer, retains at most the first 512 tokens, and
-   writes exactly one native unpacked TFRecord row per document.
+1. `soft_h` froze 10,000 selected public C4 validation documents once.
+2. The model tokenizer was used to create an immutable Fax-native unpacked
+   TFRecord artifact with one independently truncated row per source sample.
+   The temporary preparation script has been removed; experiments consume the
+   versioned artifact rather than regenerating it.
 3. Patch the checkpoint run config to use one fixed source:
    `eval_data_dir_dict = {"unpacked": {"gs://.../unpacked": 1.0}}`.
 4. Fax's existing `get_data_loaders()` and `GPTBalancedDataLoader` pad, label,
    batch, and shard those rows without packing documents or emitting
    continuation chunks.
-5. The Tax extraction script only runs `forward_with_hooks_step` and exports
-   aligned activations and loader-provided labels/sequence metadata.
+5. Tax runs `forward_with_hooks_step` and either exports aligned arrays or
+   immediately updates online entropy accumulators.
+6. For paired-backend checks, `scripts/export_eval_token_sample.py` exports the
+   exact rows emitted by the configured Fax loader. Hugging Face consumes this
+   token artifact directly, so no second tokenizer or sampling path can alter
+   the input.
 
 This route requires no changes to `fax_mono`, no new Tax dataloader, no literal
-prompt, and no custom model-side batcher. The small preprocessing script writes
-the existing Fax unpacked TFRecord contract; dataset selection remains a
-run-config override rather than model inference code.
+prompt, and no custom model-side batcher. Dataset selection remains a run-config
+override rather than model inference code.
 
-The repositories remain independent. Tax writes a portable directory of numeric
-NPZ shards plus a JSON manifest. `soft_h` reads that directory. There is no
-Python package dependency between the repositories.
+The repositories remain independently versioned. Offline mode writes portable
+numeric NPZ shards plus a JSON manifest for `soft_h` to read. Online mode stages
+an exact hash-identified copy of the `soft_entropy` package into the Tax image;
+it does not add a permanent Tax package dependency or modify `fax_mono`.
 
 ## Repository roles
 
@@ -150,11 +168,6 @@ Tests deterministic finite results and manifest shard path-traversal rejection.
 Loads `LLMInferrer` lazily. This prevents the optional `tqdm` dependency from
 being required when only `SoftEntropyAccumulator` is used.
 
-### `uv.lock` (untracked)
-
-A lockfile was generated while setting up/running the local environment. Review
-whether the project wants this file before committing it.
-
 ## Verification completed
 
 ### Unit and formatting checks
@@ -174,7 +187,8 @@ Result: pre-commit passed and all 9 extractor unit tests passed.
 
 The corresponding `soft_h` consumer tests also passed during implementation.
 
-All changes are currently uncommitted.
+Those baseline integration changes are committed. Current paired-comparison
+working-tree changes are listed at the end of this handoff.
 
 ### Tiny random-model activation smoke
 
@@ -337,36 +351,16 @@ vm-michael-rizvi-fax-202608211925-5fz3
 It remains as a failed UI record unless explicitly cancelled. Earlier failed
 records were cancelled at the user's request.
 
-## Recommended next steps
-
-### Monday: real BLS generation smoke
-
-Obtain explicit approval, then submit:
-
-- one 8-H100 worker;
-- tensor parallelism 8, matching `configs/sample.run.fragment`;
-- the existing image tag and checkpoint;
-- two generated tokens from `"Hello"`;
-- the 30-second heartbeat;
-- `dev-low` priority and the established agentic queue.
-
-Eight H100s are the canonical configuration, not merely a performance
-optimization. Four may be sufficient based on the observed memory excess, but
-that would be another noncanonical experiment. Prefer TP=8 for the next
-diagnostic unless cost/capacity requires a staged TP=4 attempt.
-
-The submission is materially more expensive than the approved 2-H100 run and
-requires fresh explicit approval.
+## Current validated workflow and results
 
 ### C4 activation extraction
 
-The controlled input begins with the pinned English C4 validation JSONL
-artifact described by its adjacent manifest. Before model inference,
-`scripts/prepare_c4_unpacked.py` uses the checkpoint tokenizer to write one
-variable-length native TFRecord row per source document, capped at 512 tokens.
-Fax's existing unpacked evaluation path then pads, labels, batches, and shards
-the rows. It never combines documents or emits a second chunk for a long
-document. With evaluation batch size 2, 10,000 paper samples are exactly 5,000
+The controlled input begins with pinned English C4 validation source samples and
+the immutable tokenizer-specific unpacked TFRecord artifact created from them.
+Each variable-length row corresponds to one source sample and is capped at 512
+tokens. Fax's existing unpacked evaluation path pads, labels, batches, and
+shards the rows. It never combines samples or emits a second chunk for a long
+sample. With evaluation batch size 2, 10,000 paper samples are exactly 5,000
 model batches.
 
 The `soft_h` consumer defaults to collision-free input/output unigram labels,
@@ -458,6 +452,242 @@ All extraction uses the checkpoint evaluation-loader interface. C4 comparisons
 replace only its data source with `--eval_data_path`; there is no custom JSONL
 branch in Tax.
 
+### Five-checkpoint 30B trajectory
+
+Five late-pretraining Baby Houselight checkpoints were evaluated at steps
+`481500`, `483500`, `485500`, `487500`, and `489470`. Every run used the same
+5,000-sample C4 prefix, 1,250 batches of size 4, all 48 block outputs, unigram
+labels, 100 bins, seed 0, and four GB200s on the SMIFS queue. Each hook
+accumulated 1,809,250 valid token positions.
+
+The first submissions all failed before model initialization because each
+foundation checkpoint's 13.66 GB `metadata.json` expanded beyond the Ray head's
+67 GiB memory limit. Tax now loads only `run_config.json` and
+`arch_config.json`, applies the inference overrides, and binds the checkpoint
+weight path afterward. This avoids deserializing training-only metadata without
+changing `fax_mono`. Unit tests and mandatory CPU preflights passed before all
+five jobs were resubmitted; all five reruns succeeded.
+
+Layer-mean trajectories were:
+
+- `H(Z)`: `0.90782 → 0.90585 → 0.90559 → 0.90375 → 0.90319`;
+- `I(X;Z)`: `0.27857 → 0.27522 → 0.27535 → 0.27405 → 0.27374`;
+- `I(Y;Z)`: `0.23368 → 0.23180 → 0.23143 → 0.23056 → 0.23008`;
+- `I(Y;Z)/I(X;Z)`: `0.83886 → 0.84226 → 0.84050 → 0.84131 → 0.84050`.
+
+From first to last checkpoint, entropy fell 0.51%, input information fell 1.73%
+in 47/48 layers, output information fell 1.54% in 47/48 layers, and
+`I(X;Z)-I(Y;Z)` shrank about 2.7%. This is consistent with late-training
+compression in the paper, but optimality increased only 0.20% and was
+non-monotonic. These checkpoints span only the final approximately 1.6% of
+optimizer steps, so they cannot reproduce the paper's full fitting-to-compression
+trajectory. Earlier ancestral checkpoints are required for that experiment.
+
+### Public-HF versus internal-Cohere sanity check
+
+The current objective is to verify that the Tax/Fax entropy pipeline is faithful
+to the previous Hugging Face `soft_h` pipeline, not merely that each pipeline
+runs independently.
+
+The paired model identity is:
+
+- internal alias: `c3_7B_12-2024_command_release`;
+- internal checkpoint:
+  `gs://cohere-command/models_experimental/eugenecho/checkpoints/r7b/ckpt-499`;
+- public model: `CohereLabs/c4ai-command-r7b-12-2024`;
+- pinned public revision:
+  `4f3d0aa6856e322f2f4480fe65420d5d53d297b8`;
+- architecture: Cohere2, 32 layers, hidden size 4,096, vocabulary 256,000;
+- inference precision: BF16 on both paths, with no FP8 or integer weight
+  quantization.
+
+#### Logit identity gate
+
+Tax's `scripts/extract_logits.py` and
+`soft_h/examples/extract_hf_logits.py` ran the two models on the exact same
+Fax-exported token IDs. `soft_h/examples/compare_logits.py` compared full
+256,000-way pre-softmax distributions. Across seven valid prediction positions:
+
+- argmax agreement: 100%;
+- mean cosine similarity: 0.999975;
+- mean centered cosine similarity: 0.999966;
+- mean absolute logit error: 0.00944;
+- mean KL divergence: 0.000594;
+- mean top-10 overlap: 97.1%.
+
+An eighth selected position was excluded because its next-token target was
+padding and the corresponding Fax prediction is not semantically valid. The
+exporter and comparator now preserve the loader prediction mask and exclude such
+positions. The logit gate establishes numerical model equivalence within
+expected BF16 and backend differences.
+
+#### Entropy agreement gate
+
+The HF runner is a narrow adapter around the original `SoftEntropyAccumulator`
+numerical core. It aligns raw block outputs and exact Fax token labels without
+forking or reimplementing the entropy estimator.
+
+The paired entropy protocol is:
+
+- first 100 samples emitted by the frozen Fax unpacked C4 loader;
+- sequence length 512 and batch size 2;
+- all 32 raw transformer block outputs;
+- 30,682 valid current/next-token positions per layer;
+- 100 bins, seed 0, unigram input/output labels;
+- NumPy `SoftEntropyAccumulator` backend on both sides, producing identical
+  random reference directions;
+- exact packaged `soft_h` source hash
+  `57fad313eab09f5344b6182881286d18fdb352ee200e45d6b039e155bb364d78`;
+- token-row hash
+  `552c0eb49fcbeb38ee893df8837a926f753ac0d38fd97d4459008ffe2ff2bfdd`;
+- Fax data-prefix hash
+  `a11e6b09877f33bf332a76666e1f0a1b75feeda42714a674f1a2fa86ad38b0d0`.
+
+`tax/scripts/export_eval_token_sample.py` exports the exact loader rows to:
+
+```text
+gs://cohere-dev/michael-rizvi/soft_h/entropy_comparison/command_r7b_n100_seq512_seed0/tokens/tokens.npz
+```
+
+This replaced the original plan to tokenize public C4 independently. The
+internal and public tokenizers agreed on BPE content but appended different
+special-token suffixes, so independently tokenizing the same text would have
+introduced a real data mismatch. Both entropy jobs now consume the Fax token
+artifact, and both results record the token, data-prefix, and source-package
+hashes.
+
+New paired-entropy components are:
+
+- `tax/scripts/export_eval_token_sample.py`: exports exact Fax-loader sequences
+  and hashes the complete loader batch prefix;
+- `soft_h/examples/extract_hf_entropy.py`: loads the pinned public causal LM,
+  captures raw block outputs, and updates one online accumulator per layer;
+- `soft_h/examples/compare_entropy_results.py`: validates experiment identity
+  and compares every layer and metric;
+- `soft_h/tests/test_entropy_comparison.py`: proves that the HF and Tax
+  accumulation adapters return identical metrics for identical activations;
+- `soft_h/examples/kjobs-hf-entropy-comparison.yaml`: one-GPU HF job resources;
+- `soft_h/examples/probe_hf_entropy_environment.py`: zero-GPU runtime dependency
+  and artifact-access probe.
+
+The comparison gates `H(Z)`, input/output mutual information, and
+input/output regularity at mean absolute error at most 0.002, maximum per-layer
+error at most 0.01, and layer-trajectory correlation at least 0.999.
+Optimality is reported but not used as a hard gate because its ratio can become
+unstable when input mutual information is near zero.
+
+Verification before launch:
+
+- Tax: 11 focused tests passed;
+- `soft_h`: 31 focused tests passed;
+- Fax CPU preflight passed with 32 hooks, batch size 2, sequence length 512,
+  and TP=1;
+- token artifact shape, source ordering, token hash, and Fax data-prefix hash
+  were validated;
+- synthetic identical-activation tests produced identical Tax and HF metrics.
+
+Cluster status:
+
+- internal Fax entropy job
+  `vm-michael-rizvi-fax-202608262145-mhrx` succeeded and wrote
+  `.../command_r7b_n100_seq512_seed0/fax/results.json`;
+- public HF job `vm-soft-h-entropy-comparison-202608262145-ovel` failed before
+  loading model weights because the vLLM image lacked SciPy;
+- zero-GPU dependency probe
+  `vm-soft-h-entropy-comparison-202608262207-duwf` subsequently succeeded.
+
+The successful probe installed and pinned `gcsfs==2026.8.0` and
+`scipy==1.18.1`, imported every runtime dependency, read and hash-checked the
+real GCS token artifact, ran the SciPy-backed entropy accumulator, and loaded
+the authenticated pinned Hugging Face model config. It also verified Torch,
+Transformers, Accelerate, Safetensors, Hugging Face Hub, NumPy, fsspec, Google
+authentication/storage, Requests, and aiohttp. The base image has unrelated
+`pip check` warnings for PyGObject/PyCairo and vLLM's aiohttp constraint; neither
+package path is used by this Transformers-based job, and real GCS I/O passed.
+
+The image is immutable and pods are ephemeral, so every HF submission must
+install the two pinned missing packages at startup.
+
+#### Numerics and tokenizer provenance
+
+A cross-backend entropy difference has two possible causes: the extraction and
+accumulation harness, which is the subject of the test, or the numerics of the
+forward pass that produced the activations. The first artifacts recorded neither
+the attention kernel nor the quantization settings, so neither a pass nor a
+failure was fully attributable. Both sides now record and enforce them.
+
+Tax writes `attention_impl`, `quantize_params`, `quantize_activations`,
+`quantize_residuals`, and `use_fp8_gemm` into `run_metadata`, and therefore into
+`results.json`, and into `run_fingerprint`. Existing accumulator checkpoints
+predating this change no longer resume, by design. Recording the value Fax
+resolves at run time is necessary rather than cosmetic: this checkpoint's own
+config migrates `ops_implementation_set='gpu_pretraining'` to
+`attention_impl='fax_fa3'`, and only the recorded field establishes that the
+`configs/sample.logit_compare.run.fragment` override to `jax_native` prevailed
+on the accelerator.
+
+`soft_h/examples/extract_hf_entropy.py` now takes `--token-artifact-dir` and
+reads `token_ids_sha256`, `data_prefix_sha256`, and `tokenizer_path` from the
+artifact's own `manifest.json` rather than from repeated command-line digests.
+It loads the public tokenizer and asserts `pad=0`, `bos=5`, `eos=255001`,
+asserts that the highest token identifier in the artifact lies inside the
+256,000-token public vocabulary, and records the observed parameter dtype and
+`model.config._attn_implementation` rather than the requested values. The
+vocabulary bound is the substantive cross-tokenizer check, because both sides
+report the same `tokenizer_path` by construction.
+
+`soft_h/examples/compare_entropy_results.py` refuses to compare artifacts whose
+numerics fall outside per-side allowlists, namely `jax_native` with all three
+quantization flags enabled and FP8 disabled on the Fax side, and `eager` with
+`torch.bfloat16` on the Hugging Face side, and requires both sides to report the
+same tokenizer.
+
+`soft_h/examples/submit_tax_activations.sh` exposes `--sample-config-path` and
+derives the reported attention kernel from the selected fragment instead of
+restating a hardcoded default. The launcher still accepts only
+`s3://us-east-01a/` checkpoints, so the Command R7B runs described here are
+submitted directly through `kjobs fax submit`.
+
+#### Entropy agreement gate result
+
+The gate passed. Jobs `vm-michael-rizvi-fax-202608262321-jmnz` and
+`vm-soft-h-entropy-comparison-202608262324-1lvn` both succeeded on
+`cw-us-east-04-prod`, writing
+`.../command_r7b_n100_seq512_seed0/fax_numerics_v2/results.json` and
+`.../command_r7b_n100_seq512_seed0/hf/results.json`. The comparison is durable
+at `.../command_r7b_n100_seq512_seed0/comparison.json`.
+
+Both sides selected 30,682 positions per layer across 32 layers. The Fax side
+recorded `attention_impl='jax_native'`, all three quantization flags enabled,
+and FP8 disabled. The Hugging Face side recorded `eager` attention and
+`torch.bfloat16` parameters.
+
+| Metric | Mean absolute error | Maximum absolute error | Layer correlation |
+| --- | --- | --- | --- |
+| `H(Z)` | 0.000238 | 0.000515 | 0.999990 |
+| `I(X;Z)/input_unigram` | 0.000071 | 0.000277 | 0.999998 |
+| `I(X;Z)/output_unigram` | 0.000032 | 0.000097 | 0.999998 |
+| `regularity/input_unigram` | 0.000140 | 0.000412 | 0.999997 |
+| `regularity/output_unigram` | 0.000038 | 0.000123 | 0.999996 |
+| `optimality/unigram` (ungated) | 0.000185 | 0.000521 | 0.999995 |
+
+Every gated metric clears its tolerance of 0.002 mean absolute error, 0.01
+maximum absolute error, and 0.999 correlation by roughly an order of magnitude
+or more. We therefore conclude that the Tax extraction and accumulation path
+reproduces the previous Hugging Face `soft_h` pipeline on this model.
+
+The re-run also reproduced the earlier `.../fax/results.json` exactly, with a
+maximum per-layer difference of zero on every metric, which establishes that the
+online path is deterministic and that the earlier artifact was produced under
+the same configuration.
+
+Two caveats remain. The Hugging Face job resolves Transformers from
+`/app/cohere/transformers` inside the vLLM image rather than from the upstream
+distribution, so the baseline is Fax against Cohere's Transformers fork; the
+results do not yet record the Transformers version or distribution. Agreement is
+established at 100 samples and unigram labels only, not at the full
+10,000-sample protocol or for higher-order backoff.
+
 ### Scientific choices still required
 
 The fixed protocol is English C4 validation, 10,000 frozen samples, 512-token
@@ -471,7 +701,35 @@ Random-model and CI-batch results are integration tests only.
 
 ## Working-tree state
 
-The checkpoint/resume baseline is committed locally as `7d73880` in `soft_h`
-and `f0ab51983` in Tax. The paper-aligned unpacked-data changes described above
-are newer working-tree changes and remain uncommitted. Generated result
-artifacts are intentionally excluded from source commits.
+Both repositories are on branch `tax-activation-integration`.
+
+Committed baselines:
+
+- `soft_h`: `48986c3` (`Add paper-aligned entropy and logit comparison`);
+- Tax: `5779f1b58` (`feat: align entropy evaluation and add logit comparison`);
+- checkpoint/resume: `7d73880` in `soft_h` and `f0ab51983` in Tax.
+
+Current uncommitted source work:
+
+- Tax modifies `scripts/extract_logits.py` and its tests, and adds
+  `scripts/export_eval_token_sample.py` plus tests;
+- Tax also modifies `scripts/extract_activations.py` to record the forward-pass
+  numerics, and `tests/fax/extract_activations_test.py` to cover them and the
+  logit-compare fragment;
+- `soft_h` modifies the HF logit runner/comparator and tests, and adds the HF
+  entropy runner, entropy comparator, job configuration, dependency probe, and
+  entropy-comparison tests;
+- `soft_h` also modifies `examples/analyze_tax_activations.py` for the extended
+  manifest schema and `examples/submit_tax_activations.sh` for
+  `--sample-config-path`;
+- this handoff update is also uncommitted.
+
+Test state after these changes: 28 Tax tests in
+`tests/fax/extract_activations_test.py` and 51 `soft_h` tests in `tests/` pass.
+`scripts/extract_logits.py` records four of the five numerics fields, omitting
+`quantize_residuals`, so the logit gate retains a narrower form of the gap
+closed above.
+
+`soft_h/artifacts/` contains generated BLS analysis output and must remain
+excluded from source commits. No commit or push has been performed for the
+current paired-comparison work.

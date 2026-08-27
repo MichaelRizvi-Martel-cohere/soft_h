@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 import torch
 
-from examples.compare_logits import compute_metrics
-from examples.extract_hf_logits import select_hf_logits
+from examples.compare_logits import _valid_prediction_mask, compute_metrics
+from examples.extract_hf_logits import _load_npz, _write_npz, select_hf_logits
 
 
 def test_compute_metrics_identical_logits():
@@ -57,6 +57,17 @@ def test_compute_metrics_rejects_shape_mismatch():
         compute_metrics(np.zeros((1, 3)), np.zeros((2, 3)))
 
 
+def test_valid_prediction_mask_excludes_padding_targets():
+    mask = _valid_prediction_mask(
+        {
+            "logits": np.zeros((3, 5), dtype=np.float32),
+            "selected_target_tokens": np.array([10, 20, 0]),
+        }
+    )
+
+    np.testing.assert_array_equal(mask, [True, True, False])
+
+
 def test_select_hf_logits_matches_numpy_indexing():
     logits = torch.arange(2 * 4 * 5, dtype=torch.bfloat16).reshape(2, 4, 5)
     rows = np.array([0, 0, 1], dtype=np.int64)
@@ -65,3 +76,15 @@ def test_select_hf_logits_matches_numpy_indexing():
     selected = select_hf_logits(logits, rows, positions)
 
     np.testing.assert_array_equal(selected, logits[rows, positions].float().numpy())
+
+
+def test_hf_artifact_io_round_trip(tmp_path):
+    path = str(tmp_path / "logits.npz")
+    arrays = {"logits": np.arange(12, dtype=np.float32).reshape(3, 4)}
+
+    _write_npz(path, arrays)
+
+    loaded = _load_npz(path)
+    np.testing.assert_array_equal(loaded["logits"], arrays["logits"])
+    with pytest.raises(FileExistsError):
+        _write_npz(path, arrays)
