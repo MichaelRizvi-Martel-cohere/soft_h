@@ -1,12 +1,12 @@
 """Temperature calibration for spherical smoothing (vMF).
 
 Solves D_KL(V_{eps, north} || U) = log(m) for eps on S^{d-1},
-with U the uniform *probability* measure 
+with U the uniform *probability* measure
 (not scipy's surface-area reference). Identity:
 
         (Amos ratio / eps) - (log vMF partition fn)
-    D_KL = A_nu(kappa)/eps - log Z_d(eps),  
-    
+    D_KL = A_nu(kappa)/eps - log Z_d(eps),
+
             nu = d/2 - 1,  kappa = 1/eps
 
 Public names mirror hcoxec/soft_h/soft_entropy/temp_calibration.py:
@@ -115,7 +115,7 @@ def sphere_temp_calibration(
     mode: "exact"  -- direct Bessel, accurate at low d,
           "bounds" -- Brentq on Psi^-, conservative; needs d > 2,
           "auto"   -- exact if d < d_threshold, else bounds.
-    eps_bracket: D_KL is decreasing in eps; low must over-target, 
+    eps_bracket: D_KL is decreasing in eps; low must over-target,
                  high must under-target.
     """
     if d_dim < 2:
