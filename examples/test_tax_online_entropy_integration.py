@@ -51,7 +51,9 @@ def run(
     if n_batches < 1:
         raise ValueError(f"n_batches must be positive, got {n_batches}.")
     soft_h_repo = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(soft_h_repo))
+    # Import soft_entropy from the copy vendored into Tax, which is what the job
+    # runs; the soft_h checkout is only needed for the examples helpers.
+    sys.path.insert(0, str(tax_repo / "scripts"))
     sys.path.insert(0, str(tax_repo))
     sys.path.insert(0, str(soft_h_repo / "examples"))
     os.chdir(tax_repo)
@@ -73,7 +75,15 @@ def run(
     )
     from tests.fax.hooks import load_config
 
+    import soft_entropy
     from soft_entropy.tax_online import TaxActivationAccumulator
+
+    vendored_root = str(tax_repo / "scripts" / "soft_entropy")
+    if not soft_entropy.__file__.startswith(vendored_root):
+        raise AssertionError(
+            f"Expected the vendored soft_entropy under {vendored_root}, "
+            f"imported {soft_entropy.__file__} instead."
+        )
 
     source = {"unpacked": {dataset_tfrecord_dir: 1.0}}
     hooks = ("block_0_block_output", "block_1_block_output")

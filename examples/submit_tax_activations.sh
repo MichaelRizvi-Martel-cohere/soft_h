@@ -20,7 +20,6 @@ readonly DEFAULT_LABEL_TYPES="unigram"
 readonly DEFAULT_CHECKPOINT_EVERY="50"
 SOFT_H_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SOFT_H_REPO
-readonly RUNTIME_PACKAGE_RELATIVE="scripts/_soft_h_runtime"
 
 usage() {
   cat <<'EOF'
@@ -322,9 +321,10 @@ if [[ "${context}" == "cw-ca-east-01-prod" ]]; then
 fi
 soft_h_package_sha256=""
 if [[ "${online_entropy}" == true ]]; then
+  # Hash the copy vendored into the Tax checkout, which is what the job imports.
   soft_h_package_sha256="$(
     uv run --project "${SOFT_H_REPO}" python "${package_script}" \
-      --soft-h-repo "${SOFT_H_REPO}" \
+      --soft-h-repo "${tax_repo}/scripts" \
       --hash-only
   )"
   extraction_args+=(
@@ -339,13 +339,8 @@ if [[ "${online_entropy}" == true ]]; then
   if [[ -n "${resume_from}" ]]; then
     extraction_args+=("--resume_from=${resume_from}")
   fi
-  container_extraction_args=(
-    env "PYTHONPATH=/app/${RUNTIME_PACKAGE_RELATIVE}"
-    "${extraction_args[@]}"
-  )
-else
-  container_extraction_args=("${extraction_args[@]}")
 fi
+container_extraction_args=("${extraction_args[@]}")
 printf -v extraction_command '%q ' "${container_extraction_args[@]}"
 
 cat <<EOF
@@ -381,28 +376,6 @@ if [[ "${submit}" != true ]]; then
   exit 0
 fi
 
-runtime_package_dir=""
-cleanup_runtime_package() {
-  if [[ -n "${runtime_package_dir}" && -d "${runtime_package_dir}" ]]; then
-    rm -r -- "${runtime_package_dir}"
-  fi
-}
-trap cleanup_runtime_package EXIT
-
-if [[ "${online_entropy}" == true ]]; then
-  runtime_package_dir="${tax_repo}/${RUNTIME_PACKAGE_RELATIVE}"
-  [[ ! -e "${runtime_package_dir}" ]] ||
-    die "Refusing to overwrite stale runtime package ${runtime_package_dir}; remove it after inspecting."
-  staged_sha="$(
-    uv run --project "${SOFT_H_REPO}" python "${package_script}" \
-      --soft-h-repo "${SOFT_H_REPO}" \
-      --output-dir "${runtime_package_dir}"
-  )"
-  [[ "${staged_sha}" == "${soft_h_package_sha256}" ]] ||
-    die "Staged soft_h package digest changed during launch."
-  printf '\nStaged soft_h package %s for the Tax image build.\n' "${staged_sha}"
-fi
-
 printf '\nRunning checkpoint, mesh, tokenizer, and paper-aligned C4 preflight on CPU...\n'
 (
   cd "${tax_repo}"
@@ -411,7 +384,6 @@ printf '\nRunning checkpoint, mesh, tokenizer, and paper-aligned C4 preflight on
       CLOUD_PROVIDER=coreweave \
       FAX_NUMBER_WORKERS="${preflight_workers}" \
       FAX_NUMBER_GPUS_PER_WORKER="${preflight_gpus_per_worker}" \
-      PYTHONPATH="${runtime_package_dir}" \
       "${extraction_args[@]}" \
       --preflight_only=True
   else
